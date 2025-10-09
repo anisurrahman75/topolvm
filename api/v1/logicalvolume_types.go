@@ -40,6 +40,67 @@ type LogicalVolumeStatus struct {
 	Code        codes.Code         `json:"code,omitempty"`
 	Message     string             `json:"message,omitempty"`
 	CurrentSize *resource.Quantity `json:"currentSize,omitempty"`
+	// +optional
+	OnlineSnapshot OnlineSnapshotStatus `json:"onlineSnapshot,omitempty"`
+}
+
+type OnlineSnapshotStatus struct {
+	// Phase represents the current phase of the snapshot
+	// +optional
+	Phase SnapshotPhase `json:"phase,omitempty"`
+
+	// Error provides structured failure info if the snapshot failed
+	// +optional
+	Error *OnlineSnapshotError `json:"error,omitempty"`
+
+	// Progress reports how much data has been backed up
+	// +optional
+	Progress *BackupProgress `json:"progress,omitempty"`
+
+	// URL is the Restic repository URL where the snapshot is stored
+	// +optional
+	URL string `json:"url,omitempty"`
+
+	// SnapshotID is the unique Restic snapshot identifier
+	// +optional
+	SnapshotID string `json:"snapshotID,omitempty"`
+
+	// Message provides a short description of the snapshot’s state
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// StartTime is when the backup process began
+	// +optional
+	StartTime *metav1.Time `json:"startTime,omitempty"`
+
+	// CompletionTime is when the backup finished (success or failure)
+	// +optional
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+
+	// RetryCount represents how many times this snapshot operation has retried (for controller logic)
+	// +optional
+	RetryCount int `json:"retryCount,omitempty"`
+
+	// Version keeps track of restic binary or backup engine version used
+	// +optional
+	Version string `json:"version,omitempty"`
+}
+
+type OnlineSnapshotError struct {
+	Code    string `json:"code,omitempty"`    // e.g., "RepositoryNotReachable", "VolumeMountFailed"
+	Message string `json:"message,omitempty"` // human-readable error
+}
+
+type BackupProgress struct {
+	// +optional
+	TotalBytes int64 `json:"totalBytes,omitempty"`
+
+	// +optional
+	BytesDone int64 `json:"bytesDone,omitempty"`
+
+	// Percentage can be calculated by controller or client (UploadedBytes / TotalBytes * 100)
+	// +optional
+	Percentage float64 `json:"percentage,omitempty"`
 }
 
 //+kubebuilder:object:root=true

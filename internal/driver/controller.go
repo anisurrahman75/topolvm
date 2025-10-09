@@ -357,6 +357,14 @@ func (s controllerServerNoLocked) CreateSnapshot(ctx context.Context, req *csi.C
 		return nil, status.Error(codes.InvalidArgument, "missing name")
 	}
 
+	params := req.GetParameters()
+
+	fmt.Println("#################################")
+	for key, val := range params {
+		fmt.Println("CreateSnapshot parameter", "key", key, "value", val)
+	}
+	fmt.Println("#################################")
+
 	name := strings.ToLower(req.GetName())
 	sourceVolID := req.GetSourceVolumeId()
 	sourceVol, err := s.lvService.GetVolume(ctx, sourceVolID)

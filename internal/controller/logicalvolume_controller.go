@@ -104,11 +104,15 @@ func (r *LogicalVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, err
 		}
 
-		err := r.expandLV(ctx, log, lv)
-		if err != nil {
-			log.Error(err, "failed to expand LV", "name", lv.Name)
+		if shouldExpandPV(lv) {
+			if err := r.expandLV(ctx, log, lv); err != nil {
+				log.Error(err, "failed to expand LV", "name", lv.Name)
+				return ctrl.Result{}, err
+			}
 		}
-		return ctrl.Result{}, err
+		// TODO: We'll write code here for online snapshot.
+
+		return ctrl.Result{}, nil
 	}
 
 	// finalization
@@ -131,6 +135,19 @@ func (r *LogicalVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
+}
+
+func shouldExpandPV(lv *topolvmv1.LogicalVolume) bool {
+	if lv.Status.CurrentSize == nil {
+		// topolvm-node may be crashed before setting Status.CurrentSize.
+		// Since the actual volume size is unknown,
+		// we need to do resizing to set Status.CurrentSize to the same value as Spec.Size.
+		return true
+	}
+	if lv.Spec.Size.Cmp(*lv.Status.CurrentSize) > 0 {
+		return true
+	}
+	return false
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -206,6 +223,7 @@ func (r *LogicalVolumeReconciler) createLV(ctx context.Context, log logr.Logger,
 
 		// Create a snapshot LV
 		if lv.Spec.Source != "" {
+			fmt.Println("############################# Snapshot LV #########################")
 			// accessType should be either "readonly" or "readwrite".
 			if lv.Spec.AccessType != "ro" && lv.Spec.AccessType != "rw" {
 				return fmt.Errorf("invalid access type for source volume: %s", lv.Spec.AccessType)
@@ -276,6 +294,7 @@ func (r *LogicalVolumeReconciler) createLV(ctx context.Context, log logr.Logger,
 	}
 
 	log.Info("created new LV", "name", lv.Name, "uid", lv.UID, "status.volumeID", lv.Status.VolumeID)
+
 	return nil
 }
 
@@ -390,3 +409,18 @@ func containsKeyAndValue(labels map[string]string, key, value string) bool {
 	}
 	return false
 }
+
+/*
+
+
+
+I want to build a Go-based server that acts as a Restic Server to handle backup, restore, and delete operations.
+
+1. bucket queue: The server will maintain a shared, concurrency-safe queue where all incoming Restic commands are stored.
+
+2. A dedicated worker process will sequentially fetch commands from this queue and execute them.
+
+3. Running Process List: Before executing a command, the worker will record its unique command UID in a concurrency-safe sync map that tracks all running processes.
+
+4. Updater: A separate monitoring process, running every 30 seconds, will iterate through all currently running commands and report their progress.
+*/
