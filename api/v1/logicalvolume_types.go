@@ -40,8 +40,11 @@ type LogicalVolumeStatus struct {
 	Code        codes.Code         `json:"code,omitempty"`
 	Message     string             `json:"message,omitempty"`
 	CurrentSize *resource.Quantity `json:"currentSize,omitempty"`
+
 	// +optional
-	OnlineSnapshot OnlineSnapshotStatus `json:"onlineSnapshot,omitempty"`
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	// +optional
+	OnlineSnapshot *OnlineSnapshotStatus `json:"onlineSnapshot,omitempty"`
 }
 
 type OnlineSnapshotStatus struct {
@@ -57,13 +60,17 @@ type OnlineSnapshotStatus struct {
 	// +optional
 	Progress *BackupProgress `json:"progress,omitempty"`
 
-	// URL is the Restic repository URL where the snapshot is stored
+	// URL is the Restic repository path where the snapshot is stored
 	// +optional
-	URL string `json:"url,omitempty"`
+	Repository string `json:"repository,omitempty"`
 
 	// SnapshotID is the unique Restic snapshot identifier
 	// +optional
 	SnapshotID string `json:"snapshotID,omitempty"`
+
+	// Paths are the paths that were backed up
+	// +optional
+	Paths []string `json:"paths,omitempty"`
 
 	// Message provides a short description of the snapshot’s state
 	// +optional
@@ -76,6 +83,10 @@ type OnlineSnapshotStatus struct {
 	// CompletionTime is when the backup finished (success or failure)
 	// +optional
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+
+	// Duration is how long the backup took
+	// +optional
+	Duration string `json:"duration,omitempty"`
 
 	// RetryCount represents how many times this snapshot operation has retried (for controller logic)
 	// +optional
@@ -100,7 +111,7 @@ type BackupProgress struct {
 
 	// Percentage can be calculated by controller or client (UploadedBytes / TotalBytes * 100)
 	// +optional
-	Percentage float64 `json:"percentage,omitempty"`
+	Percentage string `json:"percentage,omitempty"`
 }
 
 //+kubebuilder:object:root=true

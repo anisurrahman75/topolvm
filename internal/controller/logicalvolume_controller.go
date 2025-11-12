@@ -3,16 +3,21 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/go-logr/logr"
+	snapshot_api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	"github.com/topolvm/topolvm"
 	topolvmlegacyv1 "github.com/topolvm/topolvm/api/legacy/v1"
 	topolvmv1 "github.com/topolvm/topolvm/api/v1"
+	"github.com/topolvm/topolvm/internal/executor"
+	"github.com/topolvm/topolvm/internal/mounter"
 	"github.com/topolvm/topolvm/pkg/lvmd/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -27,6 +32,8 @@ type LogicalVolumeReconciler struct {
 	nodeName  string
 	vgService proto.VGServiceClient
 	lvService proto.LVServiceClient
+	lvMount   *mounter.LVMount
+	executor  executor.Executor
 }
 
 //+kubebuilder:rbac:groups=topolvm.io,resources=logicalvolumes,verbs=get;list;watch;update;patch
@@ -38,6 +45,7 @@ func NewLogicalVolumeReconcilerWithServices(client client.Client, nodeName strin
 		nodeName:  nodeName,
 		vgService: vgService,
 		lvService: lvService,
+		lvMount:   mounter.NewLVMount(vgService, lvService),
 	}
 }
 
@@ -68,6 +76,20 @@ func (r *LogicalVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			}
 			return ctrl.Result{}, nil
 		}
+	}
+	var err error
+	var vsContent *snapshot_api.VolumeSnapshotContent
+	var vsClass *snapshot_api.VolumeSnapshotClass
+	vsContent, err = r.getVSContentIfExist(ctx, lv)
+	if err != nil {
+		log.Error(err, "failed to get VolumeSnapshotContent", "name", lv.Name)
+		return ctrl.Result{}, err
+	}
+
+	vsClass, err = r.getVSClass(ctx, vsContent)
+	if err != nil {
+		log.Error(err, "failed to get VolumeSnapshotClass", "name", lv.Name)
+		return ctrl.Result{}, err
 	}
 
 	if lv.DeletionTimestamp == nil {
@@ -110,7 +132,61 @@ func (r *LogicalVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				return ctrl.Result{}, err
 			}
 		}
-		// TODO: We'll write code here for online snapshot.
+
+		onlineSnapshot, err := r.shouldTakeOnlineSnapshot(vsClass)
+		if err != nil {
+			log.Error(err, "failed to check whether to take online snapshot", "name", lv.Name)
+			return ctrl.Result{}, err
+		}
+		if onlineSnapshot {
+			if lv.Status.OnlineSnapshot == nil || lv.Status.OnlineSnapshot.Phase == "" {
+				if err := r.updateOnlineSnapshotStatus(ctx, log, lv, topolvmv1.SnapshotPending, "Initializing online snapshot", nil); err != nil {
+					log.Error(err, "failed to set online snapshot status to Pending", "name", lv.Name)
+					return ctrl.Result{}, err
+				}
+			}
+
+			if lv.Status.OnlineSnapshot.Phase == topolvmv1.SnapshotSucceeded ||
+				lv.Status.OnlineSnapshot.Phase == topolvmv1.SnapshotFailed {
+				log.Info("online snapshot already processed", "name", lv.Name, "phase", lv.Status.OnlineSnapshot.Phase)
+				return ctrl.Result{}, nil
+			}
+
+			if lv.Status.OnlineSnapshot.Phase == topolvmv1.SnapshotRunning {
+				log.Info("online snapshot is currently running", "name", lv.Name)
+				return ctrl.Result{}, nil
+			}
+
+			resp, err := r.lvMount.Mount(ctx, lv)
+			if err != nil {
+				log.Error(err, "failed to mount LV", "name", lv.Name)
+				// Set the failed phase with the mount error
+				mountErr := &topolvmv1.OnlineSnapshotError{
+					Code:    "VolumeMountFailed",
+					Message: fmt.Sprintf("failed to mount logical volume: %v", err),
+				}
+				if updateErr := r.updateOnlineSnapshotStatus(ctx, log, lv, topolvmv1.SnapshotFailed, "Failed to mount logical volume", mountErr); updateErr != nil {
+					log.Error(updateErr, "failed to set online snapshot status to Failed after mount error", "name", lv.Name)
+				}
+				return ctrl.Result{}, err
+			}
+
+			// Execute the snapshot
+			r.executor = executor.NewSnapshotExecutor(r.client, lv, resp, vsContent, vsClass)
+			if execErr := r.executor.Execute(); execErr != nil {
+				log.Error(execErr, "failed to execute snapshot", "name", lv.Name)
+				// Set the failed phase with the execution error
+				executeErr := &topolvmv1.OnlineSnapshotError{
+					Code:    "SnapshotExecutionFailed",
+					Message: fmt.Sprintf("failed to execute snapshot: %v", execErr),
+				}
+				if updateErr := r.updateOnlineSnapshotStatus(ctx, log, lv, topolvmv1.SnapshotFailed, "Failed to execute snapshot", executeErr); updateErr != nil {
+					log.Error(updateErr, "failed to set online snapshot status to Failed after execution error", "name", lv.Name)
+				}
+				return ctrl.Result{}, nil
+			}
+			return ctrl.Result{}, nil
+		}
 
 		return ctrl.Result{}, nil
 	}
@@ -122,7 +198,7 @@ func (r *LogicalVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	log.Info("start finalizing LogicalVolume", "name", lv.Name)
-	err := r.removeLVIfExists(ctx, log, lv)
+	err = r.removeLVIfExists(ctx, log, lv)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -135,6 +211,92 @@ func (r *LogicalVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *LogicalVolumeReconciler) getVSClassFromContent(ctx context.Context, content *snapshot_api.VolumeSnapshotContent) (*snapshot_api.VolumeSnapshotClass, error) {
+	vsClass := &snapshot_api.VolumeSnapshotClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: *content.Spec.VolumeSnapshotClassName,
+		},
+	}
+	if err := r.client.Get(ctx, client.ObjectKeyFromObject(vsClass), vsClass); err != nil {
+		return nil, fmt.Errorf("unable to fetch VolumeSnapshotClass %s: %v", *content.Spec.VolumeSnapshotClassName, err)
+	}
+	return vsClass, nil
+}
+
+func (r *LogicalVolumeReconciler) getVSContentIfExist(ctx context.Context, lv *topolvmv1.LogicalVolume) (*snapshot_api.VolumeSnapshotContent, error) {
+	var content *snapshot_api.VolumeSnapshotContent
+	var err error
+	if lv.Spec.Source != "" {
+		content, err = r.getSnapshotContent(ctx, lv)
+	}
+	return content, err
+}
+
+func (r *LogicalVolumeReconciler) shouldTakeOnlineSnapshot(vsClass *snapshot_api.VolumeSnapshotClass) (bool, error) {
+	var takeSnapshot bool
+	if vsClass == nil {
+		return takeSnapshot, nil
+	}
+	onlineSnapshotParam, ok := vsClass.Parameters[SnapshotMode]
+	if ok && onlineSnapshotParam == SnapshotModeOnline {
+		takeSnapshot = true
+	}
+	return takeSnapshot, nil
+}
+
+func (r *LogicalVolumeReconciler) getSnapshotContent(ctx context.Context, lv *topolvmv1.LogicalVolume) (*snapshot_api.VolumeSnapshotContent, error) {
+	content := &snapshot_api.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{
+			// https://github.com/kubernetes-csi/external-snapshotter/blob/master/pkg/utils/util.go#L283
+			Name: fmt.Sprintf("snapcontent%s", strings.TrimPrefix(lv.Spec.Name, "snapshot")),
+		},
+	}
+	if err := r.client.Get(ctx, client.ObjectKeyFromObject(content), content); err != nil {
+		return nil, fmt.Errorf("unable to fetch VolumeSnapshotContent for LogicalVolume %s: %v", lv.Name, err)
+	}
+	return content, nil
+}
+
+func (r *LogicalVolumeReconciler) getVSClass(ctx context.Context, content *snapshot_api.VolumeSnapshotContent) (*snapshot_api.VolumeSnapshotClass, error) {
+	if content == nil {
+		return nil, nil
+	}
+	vsClass := &snapshot_api.VolumeSnapshotClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: *content.Spec.VolumeSnapshotClassName,
+		},
+	}
+	if err := r.client.Get(ctx, client.ObjectKeyFromObject(vsClass), vsClass); err != nil {
+		return nil, fmt.Errorf("unable to fetch VolumeSnapshotClass %s: %v", *content.Spec.VolumeSnapshotClassName, err)
+	}
+	return vsClass, nil
+}
+
+func (r *LogicalVolumeReconciler) updateOnlineSnapshotStatus(ctx context.Context, log logr.Logger, lv *topolvmv1.LogicalVolume, phase topolvmv1.SnapshotPhase, message string, snapshotErr *topolvmv1.OnlineSnapshotError) error {
+	// Initialize OnlineSnapshot status if it doesn't exist
+	if lv.Status.OnlineSnapshot == nil {
+		lv.Status.OnlineSnapshot = &topolvmv1.OnlineSnapshotStatus{}
+	}
+
+	// Update phase and message
+	lv.Status.OnlineSnapshot.Phase = phase
+	lv.Status.OnlineSnapshot.Message = message
+
+	// Set error if provided
+	if snapshotErr != nil {
+		lv.Status.OnlineSnapshot.Error = snapshotErr
+	}
+
+	// Update the status
+	if err := r.client.Status().Update(ctx, lv); err != nil {
+		log.Error(err, "failed to update online snapshot status", "name", lv.Name, "phase", phase)
+		return err
+	}
+
+	log.Info("updated online snapshot status", "name", lv.Name, "phase", phase, "message", message)
+	return nil
 }
 
 func shouldExpandPV(lv *topolvmv1.LogicalVolume) bool {
@@ -162,6 +324,15 @@ func (r *LogicalVolumeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func (r *LogicalVolumeReconciler) removeLVIfExists(ctx context.Context, log logr.Logger, lv *topolvmv1.LogicalVolume) error {
+	// First, unmount the LV if it's mounted (e.g., for online snapshots)
+	if err := r.lvMount.Unmount(ctx, lv); err != nil {
+		log.Error(err, "failed to unmount LV before removal", "name", lv.Name, "uid", lv.UID)
+		// Continue with removal even if unmount fails, as the LV might not be mounted
+		// or the mount might have been manually removed
+	} else {
+		log.Info("successfully unmounted LV", "name", lv.Name, "uid", lv.UID)
+	}
+
 	// Finalizer's process ( RemoveLV then removeString ) is not atomic,
 	// so checking existence of LV to ensure its idempotence
 	_, err := r.lvService.RemoveLV(ctx, &proto.RemoveLVRequest{Name: string(lv.UID), DeviceClass: lv.Spec.DeviceClass})
@@ -223,7 +394,6 @@ func (r *LogicalVolumeReconciler) createLV(ctx context.Context, log logr.Logger,
 
 		// Create a snapshot LV
 		if lv.Spec.Source != "" {
-			fmt.Println("############################# Snapshot LV #########################")
 			// accessType should be either "readonly" or "readwrite".
 			if lv.Spec.AccessType != "ro" && lv.Spec.AccessType != "rw" {
 				return fmt.Errorf("invalid access type for source volume: %s", lv.Spec.AccessType)
@@ -409,18 +579,3 @@ func containsKeyAndValue(labels map[string]string, key, value string) bool {
 	}
 	return false
 }
-
-/*
-
-
-
-I want to build a Go-based server that acts as a Restic Server to handle backup, restore, and delete operations.
-
-1. bucket queue: The server will maintain a shared, concurrency-safe queue where all incoming Restic commands are stored.
-
-2. A dedicated worker process will sequentially fetch commands from this queue and execute them.
-
-3. Running Process List: Before executing a command, the worker will record its unique command UID in a concurrency-safe sync map that tracks all running processes.
-
-4. Updater: A separate monitoring process, running every 30 seconds, will iterate through all currently running commands and report their progress.
-*/
