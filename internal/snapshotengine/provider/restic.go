@@ -116,16 +116,17 @@ func (r *resticProvider) PruneRepo(_ context.Context, param RepoParam) error {
 func (r *resticProvider) Backup(ctx context.Context, param BackupParam) (*BackupResult, error) {
 	r.wrapper.SetShowCMD(true)
 	r.wrapper.AddSuffixToRepository(param.Repository)
+	param.RepoFullPath = r.wrapper.GetEnv(restic.RESTIC_REPOSITORY)
 	if exist := r.wrapper.RepositoryAlreadyExist(); !exist {
 		err := r.wrapper.InitializeRepository()
 		if err != nil {
 			return &BackupResult{
 				Phase:        BackupPhaseFailed,
 				ErrorMessage: fmt.Sprintf("failed to initialize repository: %v", err),
-				Provider:     "restic",
+				Provider:     string(v1.EngineRestic),
 				Hostname:     param.Hostname,
 				Paths:        param.BackupPaths,
-				Repository:   param.Repository,
+				Repository:   param.RepoFullPath,
 			}, err
 		}
 	}
@@ -142,10 +143,10 @@ func (r *resticProvider) Backup(ctx context.Context, param BackupParam) (*Backup
 		return &BackupResult{
 			Phase:        BackupPhaseFailed,
 			ErrorMessage: fmt.Sprintf("backup failed: %v", err),
-			Provider:     "restic",
+			Provider:     string(v1.EngineRestic),
 			Hostname:     param.Hostname,
 			Paths:        param.BackupPaths,
-			Repository:   param.Repository,
+			Repository:   param.RepoFullPath,
 		}, err
 	}
 	result := r.convertResticOutputToBackupResult(out, param)
@@ -154,10 +155,10 @@ func (r *resticProvider) Backup(ctx context.Context, param BackupParam) (*Backup
 
 func (r *resticProvider) convertResticOutputToBackupResult(output *restic.BackupOutput, param BackupParam) *BackupResult {
 	result := &BackupResult{
-		Provider:   "restic",
+		Provider:   string(v1.EngineRestic),
 		Hostname:   param.Hostname,
 		Paths:      param.BackupPaths,
-		Repository: param.Repository,
+		Repository: param.RepoFullPath,
 		BackupTime: time.Now(),
 	}
 

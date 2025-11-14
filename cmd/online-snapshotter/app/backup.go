@@ -22,23 +22,25 @@ var (
 	kubeconfigPath string
 )
 
-type options struct {
+type BackupOptions struct {
 	log    logr.Logger
 	client client.Client
 
+	// Logical volume details
 	lvName      string
 	nodeName    string
 	deviceClass string
 	mountPath   string
+	logicalVol  *topolvmv1.LogicalVolume
 
+	// References
 	timeout            time.Duration
 	targetedPVCRef     types.NamespacedName
 	snapshotStorageRef types.NamespacedName
 	snapshotStorage    *topolvmv1.OnlineSnapshotStorage
-	logicalVol         *topolvmv1.LogicalVolume
 }
 
-var opt = new(options)
+var opt = new(BackupOptions)
 
 func newBackupCommand() *cobra.Command {
 	cmd := &cobra.Command{
@@ -47,34 +49,19 @@ func newBackupCommand() *cobra.Command {
 		Long: `The backup command performs an online snapshot of a logical volume.
 		It backs up the mounted filesystem to a remote repository using Restic or Kopia.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			//cmd.SilenceUsage = true
 			ctx := context.Background()
-			opt.log = ctrl.Log.WithName("Backup")
-			cfg, err := clientcmd.BuildConfigFromFlags(masterURL, kubeconfigPath)
-			if err != nil {
+			opt.log = ctrl.Log.WithName("backup")
+
+			if err := opt.initialize(ctx); err != nil {
+				opt.log.Error(err, "initialization failed")
 				return err
 			}
-			opt.client, err = NewRuntimeClient(cfg)
-			if err != nil {
-				return fmt.Errorf("failed to get kubernetes client: %w", err)
-			}
 
-			opt.snapshotStorage, err = opt.getSnapshotStorage(ctx)
-			if err != nil {
-				return fmt.Errorf("failed to get OnlineSnapshotStorage: %w", err)
+			if err := opt.execute(ctx); err != nil {
+				opt.log.Error(err, "backup execution failed")
+				return err
 			}
-
-			opt.logicalVol, err = opt.getLogicalVolume(ctx)
-			if err != nil {
-				return fmt.Errorf("failed to get LogicalVolume: %w", err)
-			}
-
-			if err = opt.updateLVSnapshotStatusRunning(ctx); err != nil {
-				return fmt.Errorf("failed to update LV snapshot status: %w", err)
-			}
-
-			err = opt.runBackup(ctx)
-			return err
+			return nil
 		},
 	}
 	parseBackupFlags(cmd)
@@ -94,134 +81,193 @@ func parseBackupFlags(cmd *cobra.Command) {
 
 	cmd.Flags().StringVar(&opt.snapshotStorageRef.Namespace, "snapshot-storage-namespace", "", "Namespace of the OnlineSnapshotStorage CR")
 	cmd.Flags().StringVar(&opt.snapshotStorageRef.Name, "snapshot-storage-name", "", "Name of the OnlineSnapshotStorage CR")
-
-	//_ = cmd.MarkFlagRequired("logical-volume")
-	//_ = cmd.MarkFlagRequired("node-name")
-	//_ = cmd.MarkFlagRequired("mount-path")
 }
 
-func (opt *options) runBackup(ctx context.Context) error {
-	opt.log.Info("Starting online snapshot backup", "lvName", opt.lvName,
-		"nodeName", opt.nodeName, "deviceClass", opt.deviceClass, "mountPath", opt.mountPath, "snapshotStorageRef", opt.snapshotStorageRef)
+func (opt *BackupOptions) initialize(ctx context.Context) error {
+	if err := opt.setupKubernetesClient(); err != nil {
+		return fmt.Errorf("failed to setup kubernetes client: %w", err)
+	}
 
-	pvider, err := provider.GetProvider(opt.client, opt.snapshotStorage)
+	if err := opt.loadResources(ctx); err != nil {
+		return fmt.Errorf("failed to load resources: %w", err)
+	}
+
+	return nil
+}
+
+func (opt *BackupOptions) setupKubernetesClient() error {
+	cfg, err := clientcmd.BuildConfigFromFlags(masterURL, kubeconfigPath)
 	if err != nil {
-		updateErr := opt.updateBackupStatusFailed(ctx, fmt.Sprintf("failed to get snapshot provider: %v", err))
-		if updateErr != nil {
-			opt.log.Error(updateErr, "failed to update status after provider error")
-		}
-		return fmt.Errorf("failed to get snapshot engine: %w", err)
+		return fmt.Errorf("failed to build config: %w", err)
 	}
 
-	backupParams := opt.getBackupParams()
-	result, err := pvider.Backup(ctx, backupParams)
-	if err != nil || (result != nil && result.Phase == provider.BackupPhaseFailed) {
-		errorMsg := ""
-		if err != nil {
-			errorMsg = err.Error()
-		} else if result != nil {
-			errorMsg = result.ErrorMessage
-		}
-		updateErr := opt.updateBackupStatusFailed(ctx, errorMsg)
-		if updateErr != nil {
-			opt.log.Error(updateErr, "failed to update status after backup failure")
-		}
-		return fmt.Errorf("backup failed: %w", err)
+	opt.client, err = NewRuntimeClient(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to create client: %w", err)
+	}
+	opt.log.Info("kubernetes client initialized successfully")
+	return nil
+}
+
+func (opt *BackupOptions) loadResources(ctx context.Context) error {
+	var err error
+	opt.snapshotStorage, err = fetchSnapshotStorage(ctx, opt.client, metav1.ObjectMeta{Name: opt.snapshotStorageRef.Name, Namespace: opt.snapshotStorageRef.Namespace})
+	if err != nil {
+		return fmt.Errorf("failed to fetch OnlineSnapshotStorage: %w", err)
+	}
+	opt.log.Info("loaded snapshot storage", "name", opt.snapshotStorage.Name, "namespace", opt.snapshotStorage.Namespace)
+
+	opt.logicalVol, err = fetchLogicalVolume(ctx, opt.client, metav1.ObjectMeta{Name: opt.lvName})
+	if err != nil {
+		return fmt.Errorf("failed to fetch LogicalVolume: %w", err)
+	}
+	opt.log.Info("loaded logical volume", "name", opt.logicalVol.Name)
+
+	return nil
+}
+
+func (opt *BackupOptions) execute(ctx context.Context) error {
+	if err := opt.setStatusRunning(ctx); err != nil {
+		return fmt.Errorf("failed to set status to running: %w", err)
 	}
 
-	if result != nil {
-		updateErr := opt.updateBackupStatusSuccess(ctx, result)
-		if updateErr != nil {
-			opt.log.Error(updateErr, "failed to update status after successful backup")
-			return updateErr
-		}
-		opt.log.Info("Backup completed successfully", "snapshotID", result.SnapshotID, "duration", result.Duration)
+	if err := opt.performBackup(ctx); err != nil {
+		return fmt.Errorf("backup operation failed: %w", err)
+	}
+
+	return nil
+}
+
+func (opt *BackupOptions) performBackup(ctx context.Context) error {
+	opt.log.Info("starting backup operation",
+		"lvName", opt.lvName,
+		"nodeName", opt.nodeName,
+		"mountPath", opt.mountPath)
+
+	pvider, err := opt.getBackupProvider()
+	if err != nil {
+		opt.handleBackupError(ctx, "failed to initialize backup provider", err)
+		return err
+	}
+
+	result, err := opt.executeBackup(ctx, pvider)
+	if err != nil {
+		opt.handleBackupError(ctx, "backup execution failed", err)
+		return err
+	}
+
+	if err := opt.handleBackupSuccess(ctx, result); err != nil {
+		return fmt.Errorf("failed to update success status: %w", err)
 	}
 	return nil
 }
 
-func (opt *options) getBackupParams() provider.BackupParam {
-	params := provider.BackupParam{
+func (opt *BackupOptions) getBackupProvider() (provider.Provider, error) {
+	pvider, err := provider.GetProvider(opt.client, opt.snapshotStorage)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get snapshot provider: %w", err)
+	}
+	opt.log.Info("backup provider initialized", "engine", opt.snapshotStorage.Spec.Engine)
+	return pvider, nil
+}
+
+func (opt *BackupOptions) executeBackup(ctx context.Context, pvider provider.Provider) (*provider.BackupResult, error) {
+	backupParams := opt.buildBackupParams()
+	opt.log.Info("executing backup with params", "repository", backupParams.Repository, "paths", backupParams.BackupPaths)
+
+	result, err := pvider.Backup(ctx, backupParams)
+	if err != nil {
+		return nil, fmt.Errorf("backup operation failed: %w", err)
+	}
+
+	if result != nil && result.Phase == provider.BackupPhaseFailed {
+		return nil, fmt.Errorf("backup failed: %s", result.ErrorMessage)
+	}
+
+	return result, nil
+}
+
+func (opt *BackupOptions) handleBackupError(ctx context.Context, message string, err error) {
+	opt.log.Error(err, message, "lvName", opt.lvName)
+
+	errorMsg := err.Error()
+	if updateErr := opt.setStatusFailed(ctx, errorMsg); updateErr != nil {
+		opt.log.Error(updateErr, "failed to update error status", "originalError", errorMsg)
+	}
+
+	opt.log.Info("status updated to failed", "lvName", opt.lvName, "error", errorMsg)
+}
+
+func (opt *BackupOptions) handleBackupSuccess(ctx context.Context, result *provider.BackupResult) error {
+	if result == nil {
+		return fmt.Errorf("backup result is nil")
+	}
+
+	if err := opt.setStatusSuccess(ctx, result); err != nil {
+		opt.log.Error(err, "failed to update success status")
+		return err
+	}
+	opt.log.Info("backup completed successfully",
+		"snapshotID", result.SnapshotID,
+		"duration", result.Duration,
+		"uploaded", result.Size.UploadedFormatted,
+		"files", result.Files.Total)
+	return nil
+}
+
+func (opt *BackupOptions) buildBackupParams() provider.BackupParam {
+	return provider.BackupParam{
 		RepoParam: provider.RepoParam{
 			Repository: filepath.Join(opt.targetedPVCRef.Namespace, opt.targetedPVCRef.Name),
-			Hostname:   "filesystem",
+			Hostname:   hostname,
 		},
 		BackupPaths: []string{opt.mountPath},
 	}
-	return params
 }
 
-func (opt *options) getSnapshotStorage(ctx context.Context) (*topolvmv1.OnlineSnapshotStorage, error) {
-	snapshotStorage := &topolvmv1.OnlineSnapshotStorage{
-		ObjectMeta: ctrl.ObjectMeta{
-			Name:      opt.snapshotStorageRef.Name,
-			Namespace: opt.snapshotStorageRef.Namespace,
-		},
+func (opt *BackupOptions) setStatusRunning(ctx context.Context) error {
+	if opt.logicalVol.Status.OnlineSnapshot == nil {
+		opt.logicalVol.Status.OnlineSnapshot = &topolvmv1.OnlineSnapshotStatus{}
 	}
-	err := opt.client.Get(ctx, client.ObjectKeyFromObject(snapshotStorage), snapshotStorage)
-	return snapshotStorage, err
 
-}
-
-func (opt *options) getLogicalVolume(ctx context.Context) (*topolvmv1.LogicalVolume, error) {
-	lv := &topolvmv1.LogicalVolume{
-		ObjectMeta: ctrl.ObjectMeta{
-			Name: opt.lvName,
-		},
+	startTime := metav1.Now()
+	opt.logicalVol.Status.OnlineSnapshot.StartTime = &startTime
+	opt.logicalVol.Status.OnlineSnapshot.Phase = topolvmv1.SnapshotRunning
+	opt.logicalVol.Status.OnlineSnapshot.Message = fmt.Sprintf("Snapshot execution in progress")
+	if err := opt.client.Status().Update(ctx, opt.logicalVol); err != nil {
+		return fmt.Errorf("failed to update online snapshot status: %w", err)
 	}
-	err := opt.client.Get(ctx, client.ObjectKeyFromObject(lv), lv)
-	return lv, err
+	opt.log.Info("status updated to running", "lvName", opt.lvName)
+	return nil
 }
 
-func (opt *options) updateBackupStatusSuccess(ctx context.Context, result *provider.BackupResult) error {
+func (opt *BackupOptions) setStatusSuccess(ctx context.Context, result *provider.BackupResult) error {
 	// Refresh the LogicalVolume to get latest version
-	lv, err := opt.getLogicalVolume(ctx)
+	lv, err := fetchLogicalVolume(ctx, opt.client, metav1.ObjectMeta{Name: opt.lvName})
 	if err != nil {
-		return fmt.Errorf("failed to get logical volume: %w", err)
+		return fmt.Errorf("failed to refresh logical volume: %w", err)
 	}
 
-	// Initialize OnlineSnapshot status if it doesn't exist
+	// Initialize OnlineSnapshot status if needed
 	if lv.Status.OnlineSnapshot == nil {
 		lv.Status.OnlineSnapshot = &topolvmv1.OnlineSnapshotStatus{}
 	}
 
 	now := metav1.Now()
-
-	// Update status with backup result
 	lv.Status.OnlineSnapshot.Phase = topolvmv1.SnapshotSucceeded
 	lv.Status.OnlineSnapshot.SnapshotID = result.SnapshotID
-	lv.Status.OnlineSnapshot.Message = fmt.Sprintf("Backup completed successfully in %s", result.Duration)
+	lv.Status.OnlineSnapshot.Message = fmt.Sprintf("Backup completed successfully")
 	lv.Status.OnlineSnapshot.CompletionTime = &now
+	lv.Status.OnlineSnapshot.Duration = result.Duration
 	lv.Status.OnlineSnapshot.Version = result.Provider
-	lv.Status.OnlineSnapshot.Error = nil // Clear any previous errors
-
-	// Set progress information
-	lv.Status.OnlineSnapshot.Progress = &topolvmv1.BackupProgress{
-		TotalBytes: result.Size.TotalBytes,
-		BytesDone:  result.Size.UploadedBytes,
-	}
-
-	// Calculate percentage if we have valid data
-	if result.Size.TotalBytes > 0 {
-		percentage := float64(result.Size.UploadedBytes) / float64(result.Size.TotalBytes) * 100
-		lv.Status.OnlineSnapshot.Progress.Percentage = fmt.Sprintf("%.2f%%", percentage)
-	} else {
-		lv.Status.OnlineSnapshot.Progress.Percentage = "100%"
-	}
-
-	// Update the URL/Repository if available
-	if result.Repository != "" {
-		lv.Status.OnlineSnapshot.Repository = result.Repository
-	}
-
-	// Update the status
+	lv.Status.OnlineSnapshot.Error = nil
+	lv.Status.OnlineSnapshot.Repository = result.Repository
 	if err := opt.client.Status().Update(ctx, lv); err != nil {
-		opt.log.Error(err, "failed to update online snapshot status to Completed", "name", lv.Name)
-		return err
+		return fmt.Errorf("failed to update status: %w", err)
 	}
 
-	opt.log.Info("updated online snapshot status to Completed",
-		"name", lv.Name,
+	opt.log.Info("status updated to completed",
+		"lvName", lv.Name,
 		"snapshotID", result.SnapshotID,
 		"uploaded", result.Size.UploadedFormatted,
 		"total", result.Size.TotalFormatted,
@@ -231,49 +277,25 @@ func (opt *options) updateBackupStatusSuccess(ctx context.Context, result *provi
 	return nil
 }
 
-func (opt *options) updateLVSnapshotStatusRunning(ctx context.Context) error {
-	now := metav1.Now()
-	updateErr := opt.updateOnlineSnapshotStatus(ctx, topolvmv1.SnapshotRunning, "Snapshot execution in progress", nil, &now)
-	if updateErr != nil {
-		opt.log.Error(updateErr, "failed to set online snapshot status to Running", "name", opt.lvName)
-		return updateErr
-	}
-	return nil
-}
-
-func (opt *options) updateBackupStatusFailed(ctx context.Context, errorMessage string) error {
-	now := metav1.Now()
+func (opt *BackupOptions) setStatusFailed(ctx context.Context, errorMessage string) error {
 	snapshotErr := &topolvmv1.OnlineSnapshotError{
-		Code:    "BackupFailed",
+		Code:    backupErrorCode,
 		Message: errorMessage,
 	}
-	return opt.updateOnlineSnapshotStatus(ctx, topolvmv1.SnapshotFailed,
-		fmt.Sprintf("Backup failed: %s", errorMessage),
-		snapshotErr, &now)
-}
 
-func (opt *options) updateOnlineSnapshotStatus(ctx context.Context,
-	phase topolvmv1.SnapshotPhase, message string, snapshotErr *topolvmv1.OnlineSnapshotError, completionTime *metav1.Time) error {
-	// Initialize OnlineSnapshot status if it doesn't exist
 	if opt.logicalVol.Status.OnlineSnapshot == nil {
-		opt.logicalVol.Status.OnlineSnapshot = &topolvmv1.OnlineSnapshotStatus{}
+		startTime := metav1.Now()
+		opt.logicalVol.Status.OnlineSnapshot = &topolvmv1.OnlineSnapshotStatus{
+			StartTime: &startTime,
+		}
 	}
 
-	// Update phase and message
-	opt.logicalVol.Status.OnlineSnapshot.Phase = phase
-	opt.logicalVol.Status.OnlineSnapshot.Message = message
+	now := metav1.Now()
+	opt.logicalVol.Status.OnlineSnapshot.Error = snapshotErr
+	opt.logicalVol.Status.OnlineSnapshot.Phase = topolvmv1.SnapshotFailed
+	opt.logicalVol.Status.OnlineSnapshot.CompletionTime = &now
+	opt.logicalVol.Status.OnlineSnapshot.Message = fmt.Sprintf("Backup failed: %s", errorMessage)
 
-	// Set error if provided
-	if snapshotErr != nil {
-		opt.logicalVol.Status.OnlineSnapshot.Error = snapshotErr
-	}
-
-	// Set completion time if provided
-	if completionTime != nil {
-		opt.logicalVol.Status.OnlineSnapshot.CompletionTime = completionTime
-	}
-
-	// Update the status
 	if err := opt.client.Status().Update(ctx, opt.logicalVol); err != nil {
 		return fmt.Errorf("failed to update online snapshot status: %w", err)
 	}

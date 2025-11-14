@@ -6,6 +6,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/topolvm/topolvm"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
 var rootCmd = &cobra.Command{
@@ -16,6 +18,7 @@ var rootCmd = &cobra.Command{
 }
 
 func init() {
+	ctrl.SetLogger(zap.New())
 	rootCmd.AddCommand(newBackupCommand())
 	rootCmd.AddCommand(newRestoreCommand())
 }

@@ -306,6 +306,9 @@ func (w *ResticWrapper) setupEnv() error {
 
 func (w *ResticWrapper) AddSuffixToRepository(suffix string) {
 	newRepository := filepath.Join(w.GetEnv(RESTIC_REPOSITORY), suffix)
+
+	fmt.Println("New Repository:", newRepository)
+
 	w.sh.SetEnv(RESTIC_REPOSITORY, newRepository)
 }
 

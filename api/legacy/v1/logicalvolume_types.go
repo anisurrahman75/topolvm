@@ -40,6 +40,9 @@ type LogicalVolumeStatus struct {
 	Code        codes.Code         `json:"code,omitempty"`
 	Message     string             `json:"message,omitempty"`
 	CurrentSize *resource.Quantity `json:"currentSize,omitempty"`
+
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 	// +optional
 	OnlineSnapshot *OnlineSnapshotStatus `json:"onlineSnapshot,omitempty"`
 }

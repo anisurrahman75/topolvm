@@ -134,6 +134,7 @@ func (w *ResticWrapper) SetEnv(key, value string) {
 		w.sh.SetEnv(key, value)
 	}
 }
+
 func (w *ResticWrapper) SetStdOut(stdBuffer bytes.Buffer) {
 	w.sh.Stdout = &stdBuffer
 }

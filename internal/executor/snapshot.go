@@ -255,7 +255,7 @@ func (e *SnapshotExecutor) buildSnapshotArgs() []string {
 		fmt.Sprintf("--node-name=%s", e.logicalVolume.Spec.NodeName),
 		fmt.Sprintf("--mount-path=%s", SnapshotData),
 		fmt.Sprintf("--targeted-pvc-namespace=%s", e.targetPVCInfo.Namespace),
-		fmt.Sprintf("--targeted-pvc-namespace=%s", e.targetPVCInfo.Name),
+		fmt.Sprintf("--targeted-pvc-name=%s", e.targetPVCInfo.Name),
 		fmt.Sprintf("--snapshot-storage-name=%s", defaultNamespaceIfEmpty(e.vsClass.Parameters[SnapshotStorageName])),
 		fmt.Sprintf("--snapshot-storage-namespace=%s", defaultNamespaceIfEmpty(e.vsClass.Parameters[SnapshotStorageNamespace])),
 	}

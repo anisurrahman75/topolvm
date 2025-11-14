@@ -139,53 +139,10 @@ func (r *LogicalVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, err
 		}
 		if onlineSnapshot {
-			if lv.Status.OnlineSnapshot == nil || lv.Status.OnlineSnapshot.Phase == "" {
-				if err := r.updateOnlineSnapshotStatus(ctx, log, lv, topolvmv1.SnapshotPending, "Initializing online snapshot", nil); err != nil {
-					log.Error(err, "failed to set online snapshot status to Pending", "name", lv.Name)
-					return ctrl.Result{}, err
-				}
-			}
-
-			if lv.Status.OnlineSnapshot.Phase == topolvmv1.SnapshotSucceeded ||
-				lv.Status.OnlineSnapshot.Phase == topolvmv1.SnapshotFailed {
-				log.Info("online snapshot already processed", "name", lv.Name, "phase", lv.Status.OnlineSnapshot.Phase)
-				return ctrl.Result{}, nil
-			}
-
-			if lv.Status.OnlineSnapshot.Phase == topolvmv1.SnapshotRunning {
-				log.Info("online snapshot is currently running", "name", lv.Name)
-				return ctrl.Result{}, nil
-			}
-
-			resp, err := r.lvMount.Mount(ctx, lv)
+			err := r.takeOnlineSnapshot(ctx, log, lv, vsContent, vsClass)
 			if err != nil {
-				log.Error(err, "failed to mount LV", "name", lv.Name)
-				// Set the failed phase with the mount error
-				mountErr := &topolvmv1.OnlineSnapshotError{
-					Code:    "VolumeMountFailed",
-					Message: fmt.Sprintf("failed to mount logical volume: %v", err),
-				}
-				if updateErr := r.updateOnlineSnapshotStatus(ctx, log, lv, topolvmv1.SnapshotFailed, "Failed to mount logical volume", mountErr); updateErr != nil {
-					log.Error(updateErr, "failed to set online snapshot status to Failed after mount error", "name", lv.Name)
-				}
 				return ctrl.Result{}, err
 			}
-
-			// Execute the snapshot
-			r.executor = executor.NewSnapshotExecutor(r.client, lv, resp, vsContent, vsClass)
-			if execErr := r.executor.Execute(); execErr != nil {
-				log.Error(execErr, "failed to execute snapshot", "name", lv.Name)
-				// Set the failed phase with the execution error
-				executeErr := &topolvmv1.OnlineSnapshotError{
-					Code:    "SnapshotExecutionFailed",
-					Message: fmt.Sprintf("failed to execute snapshot: %v", execErr),
-				}
-				if updateErr := r.updateOnlineSnapshotStatus(ctx, log, lv, topolvmv1.SnapshotFailed, "Failed to execute snapshot", executeErr); updateErr != nil {
-					log.Error(updateErr, "failed to set online snapshot status to Failed after execution error", "name", lv.Name)
-				}
-				return ctrl.Result{}, nil
-			}
-			return ctrl.Result{}, nil
 		}
 
 		return ctrl.Result{}, nil
@@ -244,6 +201,57 @@ func (r *LogicalVolumeReconciler) shouldTakeOnlineSnapshot(vsClass *snapshot_api
 		takeSnapshot = true
 	}
 	return takeSnapshot, nil
+}
+
+func (r *LogicalVolumeReconciler) takeOnlineSnapshot(ctx context.Context, log logr.Logger, lv *topolvmv1.LogicalVolume,
+	vsContent *snapshot_api.VolumeSnapshotContent, vsClass *snapshot_api.VolumeSnapshotClass) error {
+	if lv.Status.OnlineSnapshot == nil || lv.Status.OnlineSnapshot.Phase == "" {
+		if err := r.updateOnlineSnapshotStatus(ctx, log, lv, topolvmv1.SnapshotPending, "Initializing online snapshot", nil); err != nil {
+			log.Error(err, "failed to set online snapshot status to Pending", "name", lv.Name)
+			return err
+		}
+	}
+
+	if lv.Status.OnlineSnapshot.Phase == topolvmv1.SnapshotSucceeded ||
+		lv.Status.OnlineSnapshot.Phase == topolvmv1.SnapshotFailed {
+		log.Info("online snapshot already processed", "name", lv.Name, "phase", lv.Status.OnlineSnapshot.Phase)
+		return nil
+	}
+
+	if lv.Status.OnlineSnapshot.Phase == topolvmv1.SnapshotRunning {
+		log.Info("online snapshot is currently running", "name", lv.Name)
+		return nil
+	}
+
+	resp, err := r.lvMount.Mount(ctx, lv)
+	if err != nil {
+		log.Error(err, "failed to mount LV", "name", lv.Name)
+		// Set the failed phase with the mount error
+		mountErr := &topolvmv1.OnlineSnapshotError{
+			Code:    "VolumeMountFailed",
+			Message: fmt.Sprintf("failed to mount logical volume: %v", err),
+		}
+		if updateErr := r.updateOnlineSnapshotStatus(ctx, log, lv, topolvmv1.SnapshotFailed, "Failed to mount logical volume", mountErr); updateErr != nil {
+			log.Error(updateErr, "failed to set online snapshot status to Failed after mount error", "name", lv.Name)
+		}
+		return err
+	}
+
+	// Execute the snapshot
+	r.executor = executor.NewSnapshotExecutor(r.client, lv, resp, vsContent, vsClass)
+	if execErr := r.executor.Execute(); execErr != nil {
+		log.Error(execErr, "failed to execute snapshot", "name", lv.Name)
+		// Set the failed phase with the execution error
+		executeErr := &topolvmv1.OnlineSnapshotError{
+			Code:    "SnapshotExecutionFailed",
+			Message: fmt.Sprintf("failed to execute snapshot: %v", execErr),
+		}
+		if updateErr := r.updateOnlineSnapshotStatus(ctx, log, lv, topolvmv1.SnapshotFailed, "Failed to execute snapshot", executeErr); updateErr != nil {
+			log.Error(updateErr, "failed to set online snapshot status to Failed after execution error", "name", lv.Name)
+		}
+		return execErr
+	}
+	return nil
 }
 
 func (r *LogicalVolumeReconciler) getSnapshotContent(ctx context.Context, lv *topolvmv1.LogicalVolume) (*snapshot_api.VolumeSnapshotContent, error) {

@@ -7,8 +7,9 @@ import (
 
 // RepoParam includes the parameters to manipulate a backup repository
 type RepoParam struct {
-	Repository string
-	Hostname   string
+	RepoFullPath string // It only uses to set the backup/restore result
+	Repository   string
+	Hostname     string
 }
 
 // BackupParam includes parameters for backup operations

@@ -5,6 +5,7 @@
 package v1
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 )
 
@@ -136,6 +137,13 @@ func (in *LogicalVolumeStatus) DeepCopyInto(out *LogicalVolumeStatus) {
 		x := (*in).DeepCopy()
 		*out = &x
 	}
+	if in.Conditions != nil {
+		in, out := &in.Conditions, &out.Conditions
+		*out = make([]metav1.Condition, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
 	if in.OnlineSnapshot != nil {
 		in, out := &in.OnlineSnapshot, &out.OnlineSnapshot
 		*out = new(OnlineSnapshotStatus)
@@ -180,6 +188,11 @@ func (in *OnlineSnapshotStatus) DeepCopyInto(out *OnlineSnapshotStatus) {
 		in, out := &in.Progress, &out.Progress
 		*out = new(BackupProgress)
 		**out = **in
+	}
+	if in.Paths != nil {
+		in, out := &in.Paths, &out.Paths
+		*out = make([]string, len(*in))
+		copy(*out, *in)
 	}
 	if in.StartTime != nil {
 		in, out := &in.StartTime, &out.StartTime
