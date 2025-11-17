@@ -77,20 +77,6 @@ func (r *LogicalVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, nil
 		}
 	}
-	var err error
-	var vsContent *snapshot_api.VolumeSnapshotContent
-	var vsClass *snapshot_api.VolumeSnapshotClass
-	vsContent, err = r.getVSContentIfExist(ctx, lv)
-	if err != nil {
-		log.Error(err, "failed to get VolumeSnapshotContent", "name", lv.Name)
-		return ctrl.Result{}, err
-	}
-
-	vsClass, err = r.getVSClass(ctx, vsContent)
-	if err != nil {
-		log.Error(err, "failed to get VolumeSnapshotClass", "name", lv.Name)
-		return ctrl.Result{}, err
-	}
 
 	if lv.DeletionTimestamp == nil {
 		if !controllerutil.ContainsFinalizer(lv, topolvm.GetLogicalVolumeFinalizer()) {
@@ -132,14 +118,48 @@ func (r *LogicalVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				return ctrl.Result{}, err
 			}
 		}
+		var vsContent *snapshot_api.VolumeSnapshotContent
+		var vsClass *snapshot_api.VolumeSnapshotClass
 
-		onlineSnapshot, err := r.shouldTakeOnlineSnapshot(vsClass)
+		snapshotLV, err := r.getSnapshotLV(ctx, lv)
 		if err != nil {
-			log.Error(err, "failed to check whether to take online snapshot", "name", lv.Name)
+			log.Error(err, "failed to get snapshot LV", "name", lv.Name)
 			return ctrl.Result{}, err
 		}
-		if onlineSnapshot {
-			err := r.takeOnlineSnapshot(ctx, log, lv, vsContent, vsClass)
+		fmt.Println("######### LV: ", lv.Name, " snapshotLV: ", snapshotLV == nil)
+		if snapshotLV != nil {
+			log.Info("snapshot LV found", "name", snapshotLV.Name)
+			vsContent, vsClass, err = r.getVSContentAndClassIfExist(ctx, snapshotLV)
+			if err != nil {
+				log.Error(err, "failed to get VolumeSnapshotContent and VolumeSnapshotClass", "name", lv.Name)
+				return ctrl.Result{}, err
+			}
+			yes, err := r.shouldRestoreFromSnapshot(snapshotLV, vsClass)
+			if err != nil {
+				log.Error(err, "failed to check whether to restore from snapshot", "name", lv.Name)
+				return ctrl.Result{}, err
+			}
+			if yes {
+				err := r.restoreFromSnapshot(ctx, log, lv, snapshotLV, vsContent, vsClass)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+			}
+		}
+		//var err error
+
+		vsContent, vsClass, err = r.getVSContentAndClassIfExist(ctx, lv)
+		if err != nil {
+			log.Error(err, "failed to get VolumeSnapshotContent and VolumeSnapshotClass", "name", lv.Name)
+			return ctrl.Result{}, err
+		}
+		yes, err := r.shouldTakeSnapshot(vsClass)
+		if err != nil {
+			log.Error(err, "failed to check whether to take snapshot", "name", lv.Name)
+			return ctrl.Result{}, err
+		}
+		if yes {
+			err := r.takeSnapshot(ctx, log, lv, vsContent, vsClass)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -155,7 +175,7 @@ func (r *LogicalVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	log.Info("start finalizing LogicalVolume", "name", lv.Name)
-	err = r.removeLVIfExists(ctx, log, lv)
+	err := r.removeLVIfExists(ctx, log, lv)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -191,7 +211,19 @@ func (r *LogicalVolumeReconciler) getVSContentIfExist(ctx context.Context, lv *t
 	return content, err
 }
 
-func (r *LogicalVolumeReconciler) shouldTakeOnlineSnapshot(vsClass *snapshot_api.VolumeSnapshotClass) (bool, error) {
+func (r *LogicalVolumeReconciler) getVSContentAndClassIfExist(ctx context.Context, lv *topolvmv1.LogicalVolume) (*snapshot_api.VolumeSnapshotContent, *snapshot_api.VolumeSnapshotClass, error) {
+	content, err := r.getVSContentIfExist(ctx, lv)
+	if err != nil {
+		return nil, nil, client.IgnoreNotFound(err)
+	}
+	if content == nil {
+		return nil, nil, nil
+	}
+	vsClass, err := r.getVSClassFromContent(ctx, content)
+	return content, vsClass, err
+}
+
+func (r *LogicalVolumeReconciler) shouldTakeSnapshot(vsClass *snapshot_api.VolumeSnapshotClass) (bool, error) {
 	var takeSnapshot bool
 	if vsClass == nil {
 		return takeSnapshot, nil
@@ -203,22 +235,56 @@ func (r *LogicalVolumeReconciler) shouldTakeOnlineSnapshot(vsClass *snapshot_api
 	return takeSnapshot, nil
 }
 
-func (r *LogicalVolumeReconciler) takeOnlineSnapshot(ctx context.Context, log logr.Logger, lv *topolvmv1.LogicalVolume,
+func (r *LogicalVolumeReconciler) getSnapshotLV(ctx context.Context, lv *topolvmv1.LogicalVolume) (*topolvmv1.LogicalVolume, error) {
+	var snapshotLv *topolvmv1.LogicalVolume
+	if lv.Spec.Source == "" {
+		return snapshotLv, nil
+	}
+	snapshotLv = &topolvmv1.LogicalVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: lv.Spec.Source,
+		},
+	}
+	// Ignore errors if the snapshot LV doesn't exist For VolumeSnapshot LV it doesn't exist. It'll only exist while restoring from any VS.
+	if err := r.client.Get(ctx, client.ObjectKeyFromObject(snapshotLv), snapshotLv); err != nil {
+		return snapshotLv, client.IgnoreNotFound(err)
+	}
+	return snapshotLv, nil
+}
+
+func (r *LogicalVolumeReconciler) shouldRestoreFromSnapshot(snapshotLv *topolvmv1.LogicalVolume, vsClass *snapshot_api.VolumeSnapshotClass) (bool, error) {
+	var takeRestore bool
+	if snapshotLv.Status.Snapshot == nil ||
+		(snapshotLv.Status.Snapshot != nil && snapshotLv.Status.Snapshot.Phase == topolvmv1.OperationPhaseSucceeded) {
+		if vsClass == nil {
+			return takeRestore, nil
+		}
+		onlineSnapshotParam, ok := vsClass.Parameters[SnapshotMode]
+		if ok && onlineSnapshotParam == SnapshotModeOnline {
+			takeRestore = true
+		}
+	}
+	return takeRestore, nil
+}
+
+func (r *LogicalVolumeReconciler) takeSnapshot(ctx context.Context, log logr.Logger, lv *topolvmv1.LogicalVolume,
 	vsContent *snapshot_api.VolumeSnapshotContent, vsClass *snapshot_api.VolumeSnapshotClass) error {
-	if lv.Status.OnlineSnapshot == nil || lv.Status.OnlineSnapshot.Phase == "" {
-		if err := r.updateOnlineSnapshotStatus(ctx, log, lv, topolvmv1.SnapshotPending, "Initializing online snapshot", nil); err != nil {
+	if lv.Status.Snapshot == nil || lv.Status.Snapshot.Phase == "" {
+		msg := fmt.Sprintf("Initializing online snapshot")
+		if err := r.updateOnlineSnapshotStatus(ctx, lv, topolvmv1.OperationBackup, topolvmv1.OperationPhasePending, msg, nil); err != nil {
 			log.Error(err, "failed to set online snapshot status to Pending", "name", lv.Name)
 			return err
 		}
+		log.Info("updated online snapshot status", "name", lv.Name, "phase", topolvmv1.OperationPhasePending, "message", msg)
 	}
 
-	if lv.Status.OnlineSnapshot.Phase == topolvmv1.SnapshotSucceeded ||
-		lv.Status.OnlineSnapshot.Phase == topolvmv1.SnapshotFailed {
-		log.Info("online snapshot already processed", "name", lv.Name, "phase", lv.Status.OnlineSnapshot.Phase)
+	if lv.Status.Snapshot.Phase == topolvmv1.OperationPhaseSucceeded ||
+		lv.Status.Snapshot.Phase == topolvmv1.OperationPhaseFailed {
+		log.Info("online snapshot already processed", "name", lv.Name, "phase", lv.Status.Snapshot.Phase)
 		return nil
 	}
 
-	if lv.Status.OnlineSnapshot.Phase == topolvmv1.SnapshotRunning {
+	if lv.Status.Snapshot.Phase == topolvmv1.OperationPhaseRunning {
 		log.Info("online snapshot is currently running", "name", lv.Name)
 		return nil
 	}
@@ -227,13 +293,15 @@ func (r *LogicalVolumeReconciler) takeOnlineSnapshot(ctx context.Context, log lo
 	if err != nil {
 		log.Error(err, "failed to mount LV", "name", lv.Name)
 		// Set the failed phase with the mount error
-		mountErr := &topolvmv1.OnlineSnapshotError{
+		mountErr := &topolvmv1.SnapshotError{
 			Code:    "VolumeMountFailed",
 			Message: fmt.Sprintf("failed to mount logical volume: %v", err),
 		}
-		if updateErr := r.updateOnlineSnapshotStatus(ctx, log, lv, topolvmv1.SnapshotFailed, "Failed to mount logical volume", mountErr); updateErr != nil {
+		msg := fmt.Sprintf("Failed to mount logical volume: %v", err)
+		if updateErr := r.updateOnlineSnapshotStatus(ctx, lv, topolvmv1.OperationBackup, topolvmv1.OperationPhaseFailed, msg, mountErr); updateErr != nil {
 			log.Error(updateErr, "failed to set online snapshot status to Failed after mount error", "name", lv.Name)
 		}
+		log.Info("updated online snapshot status", "name", lv.Name, "phase", topolvmv1.OperationPhaseFailed, "message", msg)
 		return err
 	}
 
@@ -242,16 +310,43 @@ func (r *LogicalVolumeReconciler) takeOnlineSnapshot(ctx context.Context, log lo
 	if execErr := r.executor.Execute(); execErr != nil {
 		log.Error(execErr, "failed to execute snapshot", "name", lv.Name)
 		// Set the failed phase with the execution error
-		executeErr := &topolvmv1.OnlineSnapshotError{
+		executeErr := &topolvmv1.SnapshotError{
 			Code:    "SnapshotExecutionFailed",
 			Message: fmt.Sprintf("failed to execute snapshot: %v", execErr),
 		}
-		if updateErr := r.updateOnlineSnapshotStatus(ctx, log, lv, topolvmv1.SnapshotFailed, "Failed to execute snapshot", executeErr); updateErr != nil {
+		msg := fmt.Sprintf("Failed to execute snapshot: %v", execErr)
+		if updateErr := r.updateOnlineSnapshotStatus(ctx, lv, topolvmv1.OperationBackup, topolvmv1.OperationPhaseFailed, msg, executeErr); updateErr != nil {
 			log.Error(updateErr, "failed to set online snapshot status to Failed after execution error", "name", lv.Name)
 		}
+		log.Info("updated online snapshot status", "name", lv.Name, "phase", topolvmv1.OperationPhaseFailed, "message", msg)
 		return execErr
 	}
 	return nil
+}
+
+func (r *LogicalVolumeReconciler) restoreFromSnapshot(ctx context.Context, log logr.Logger, lv *topolvmv1.LogicalVolume,
+	snapshotLv *topolvmv1.LogicalVolume, vsContent *snapshot_api.VolumeSnapshotContent, vsClass *snapshot_api.VolumeSnapshotClass) error {
+	if lv.Status.Snapshot == nil || lv.Status.Snapshot.Phase == "" {
+		msg := fmt.Sprintf("Initializing online restore")
+		if err := r.updateOnlineSnapshotStatus(ctx, lv, topolvmv1.OperationRestore, topolvmv1.OperationPhasePending, msg, nil); err != nil {
+			log.Error(err, "failed to set online restore status to Pending", "name", lv.Name)
+			return err
+		}
+		log.Info("updated online restore status", "name", lv.Name, "phase", topolvmv1.OperationPhasePending, "message", msg)
+	}
+
+	if lv.Status.Snapshot.Phase == topolvmv1.OperationPhaseSucceeded ||
+		lv.Status.Snapshot.Phase == topolvmv1.OperationPhaseFailed {
+		log.Info("online restore already processed", "name", lv.Name, "phase", lv.Status.Snapshot.Phase)
+		return nil
+	}
+
+	if lv.Status.Snapshot.Phase == topolvmv1.OperationPhaseRunning {
+		log.Info("online restore is currently running", "name", lv.Name)
+		return nil
+	}
+	return nil
+
 }
 
 func (r *LogicalVolumeReconciler) getSnapshotContent(ctx context.Context, lv *topolvmv1.LogicalVolume) (*snapshot_api.VolumeSnapshotContent, error) {
@@ -282,28 +377,28 @@ func (r *LogicalVolumeReconciler) getVSClass(ctx context.Context, content *snaps
 	return vsClass, nil
 }
 
-func (r *LogicalVolumeReconciler) updateOnlineSnapshotStatus(ctx context.Context, log logr.Logger, lv *topolvmv1.LogicalVolume, phase topolvmv1.SnapshotPhase, message string, snapshotErr *topolvmv1.OnlineSnapshotError) error {
+func (r *LogicalVolumeReconciler) updateOnlineSnapshotStatus(ctx context.Context, lv *topolvmv1.LogicalVolume,
+	opType topolvmv1.OperationType, phase topolvmv1.OperationPhase, message string, snapshotErr *topolvmv1.SnapshotError) error {
 	// Initialize OnlineSnapshot status if it doesn't exist
-	if lv.Status.OnlineSnapshot == nil {
-		lv.Status.OnlineSnapshot = &topolvmv1.OnlineSnapshotStatus{}
+	if lv.Status.Snapshot == nil {
+		lv.Status.Snapshot = &topolvmv1.SnapshotStatus{}
+		lv.Status.Snapshot.StartTime = metav1.Now()
 	}
 
 	// Update phase and message
-	lv.Status.OnlineSnapshot.Phase = phase
-	lv.Status.OnlineSnapshot.Message = message
+	lv.Status.Snapshot.Operation = opType
+	lv.Status.Snapshot.Phase = phase
+	lv.Status.Snapshot.Message = message
 
 	// Set error if provided
 	if snapshotErr != nil {
-		lv.Status.OnlineSnapshot.Error = snapshotErr
+		lv.Status.Snapshot.Error = snapshotErr
 	}
 
 	// Update the status
 	if err := r.client.Status().Update(ctx, lv); err != nil {
-		log.Error(err, "failed to update online snapshot status", "name", lv.Name, "phase", phase)
 		return err
 	}
-
-	log.Info("updated online snapshot status", "name", lv.Name, "phase", phase, "message", message)
 	return nil
 }
 

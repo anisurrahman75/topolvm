@@ -226,14 +226,13 @@ func (opt *BackupOptions) buildBackupParams() provider.BackupParam {
 }
 
 func (opt *BackupOptions) setStatusRunning(ctx context.Context) error {
-	if opt.logicalVol.Status.OnlineSnapshot == nil {
-		opt.logicalVol.Status.OnlineSnapshot = &topolvmv1.OnlineSnapshotStatus{}
+	if opt.logicalVol.Status.Snapshot == nil {
+		opt.logicalVol.Status.Snapshot = &topolvmv1.SnapshotStatus{}
 	}
 
-	startTime := metav1.Now()
-	opt.logicalVol.Status.OnlineSnapshot.StartTime = &startTime
-	opt.logicalVol.Status.OnlineSnapshot.Phase = topolvmv1.SnapshotRunning
-	opt.logicalVol.Status.OnlineSnapshot.Message = fmt.Sprintf("Snapshot execution in progress")
+	opt.logicalVol.Status.Snapshot.StartTime = metav1.Now()
+	opt.logicalVol.Status.Snapshot.Phase = topolvmv1.OperationPhaseRunning
+	opt.logicalVol.Status.Snapshot.Message = fmt.Sprintf("Snapshot execution in progress")
 	if err := opt.client.Status().Update(ctx, opt.logicalVol); err != nil {
 		return fmt.Errorf("failed to update online snapshot status: %w", err)
 	}
@@ -249,19 +248,19 @@ func (opt *BackupOptions) setStatusSuccess(ctx context.Context, result *provider
 	}
 
 	// Initialize OnlineSnapshot status if needed
-	if lv.Status.OnlineSnapshot == nil {
-		lv.Status.OnlineSnapshot = &topolvmv1.OnlineSnapshotStatus{}
+	if lv.Status.Snapshot == nil {
+		lv.Status.Snapshot = &topolvmv1.SnapshotStatus{}
 	}
 
 	now := metav1.Now()
-	lv.Status.OnlineSnapshot.Phase = topolvmv1.SnapshotSucceeded
-	lv.Status.OnlineSnapshot.SnapshotID = result.SnapshotID
-	lv.Status.OnlineSnapshot.Message = fmt.Sprintf("Backup completed successfully")
-	lv.Status.OnlineSnapshot.CompletionTime = &now
-	lv.Status.OnlineSnapshot.Duration = result.Duration
-	lv.Status.OnlineSnapshot.Version = result.Provider
-	lv.Status.OnlineSnapshot.Error = nil
-	lv.Status.OnlineSnapshot.Repository = result.Repository
+	lv.Status.Snapshot.Phase = topolvmv1.OperationPhaseSucceeded
+	lv.Status.Snapshot.SnapshotID = result.SnapshotID
+	lv.Status.Snapshot.Message = fmt.Sprintf("Backup completed successfully")
+	lv.Status.Snapshot.CompletionTime = &now
+	lv.Status.Snapshot.Duration = result.Duration
+	lv.Status.Snapshot.Version = result.Provider
+	lv.Status.Snapshot.Error = nil
+	lv.Status.Snapshot.Repository = result.Repository
 	if err := opt.client.Status().Update(ctx, lv); err != nil {
 		return fmt.Errorf("failed to update status: %w", err)
 	}
@@ -278,23 +277,21 @@ func (opt *BackupOptions) setStatusSuccess(ctx context.Context, result *provider
 }
 
 func (opt *BackupOptions) setStatusFailed(ctx context.Context, errorMessage string) error {
-	snapshotErr := &topolvmv1.OnlineSnapshotError{
+	snapshotErr := &topolvmv1.SnapshotError{
 		Code:    backupErrorCode,
 		Message: errorMessage,
 	}
 
-	if opt.logicalVol.Status.OnlineSnapshot == nil {
-		startTime := metav1.Now()
-		opt.logicalVol.Status.OnlineSnapshot = &topolvmv1.OnlineSnapshotStatus{
-			StartTime: &startTime,
+	if opt.logicalVol.Status.Snapshot == nil {
+		opt.logicalVol.Status.Snapshot = &topolvmv1.SnapshotStatus{
+			StartTime: metav1.Now(),
 		}
 	}
-
 	now := metav1.Now()
-	opt.logicalVol.Status.OnlineSnapshot.Error = snapshotErr
-	opt.logicalVol.Status.OnlineSnapshot.Phase = topolvmv1.SnapshotFailed
-	opt.logicalVol.Status.OnlineSnapshot.CompletionTime = &now
-	opt.logicalVol.Status.OnlineSnapshot.Message = fmt.Sprintf("Backup failed: %s", errorMessage)
+	opt.logicalVol.Status.Snapshot.Error = snapshotErr
+	opt.logicalVol.Status.Snapshot.Phase = topolvmv1.OperationPhaseFailed
+	opt.logicalVol.Status.Snapshot.CompletionTime = &now
+	opt.logicalVol.Status.Snapshot.Message = fmt.Sprintf("Backup failed: %s", errorMessage)
 
 	if err := opt.client.Status().Update(ctx, opt.logicalVol); err != nil {
 		return fmt.Errorf("failed to update online snapshot status: %w", err)

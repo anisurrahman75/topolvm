@@ -57,20 +57,20 @@ func fetchLogicalVolume(ctx context.Context, client client.Client, objMeta metav
 }
 
 func updateStatus(ctx context.Context, client client.Client, lv *topolvmv1.LogicalVolume,
-	phase topolvmv1.SnapshotPhase, message string, snapshotErr *topolvmv1.OnlineSnapshotError) error {
+	phase topolvmv1.OperationPhase, message string, snapshotErr *topolvmv1.SnapshotError) error {
 
-	if lv.Status.OnlineSnapshot == nil {
+	if lv.Status.Snapshot == nil {
 		startTime := metav1.Now()
-		lv.Status.OnlineSnapshot = &topolvmv1.OnlineSnapshotStatus{
-			StartTime: &startTime,
+		lv.Status.Snapshot = &topolvmv1.SnapshotStatus{
+			StartTime: startTime,
 		}
 	}
 
-	lv.Status.OnlineSnapshot.Phase = phase
-	lv.Status.OnlineSnapshot.Message = message
+	lv.Status.Snapshot.Phase = phase
+	lv.Status.Snapshot.Message = message
 
 	if snapshotErr != nil {
-		lv.Status.OnlineSnapshot.Error = snapshotErr
+		lv.Status.Snapshot.Error = snapshotErr
 	}
 
 	if err := client.Status().Update(ctx, lv); err != nil {

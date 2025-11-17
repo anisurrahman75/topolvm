@@ -43,64 +43,122 @@ type LogicalVolumeStatus struct {
 
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	//// +optional
+	//OnlineSnapshot *OnlineSnapshotStatus `json:"onlineSnapshot,omitempty"`
+
 	// +optional
-	OnlineSnapshot *OnlineSnapshotStatus `json:"onlineSnapshot,omitempty"`
+	Snapshot *SnapshotStatus `json:"snapshot,omitempty"`
 }
 
-type OnlineSnapshotStatus struct {
-	// Phase represents the current phase of the snapshot
+// SnapshotStatus defines the observed state of a backup or restore operation.
+type SnapshotStatus struct {
+	// Operation indicates whether this status is for a backup or a restore.
 	// +optional
-	Phase SnapshotPhase `json:"phase,omitempty"`
-
-	// Error provides structured failure info if the snapshot failed
+	Operation OperationType `json:"operation,omitempty"`
+	// Phase represents the current phase of the backup or restore operation.
+	Phase OperationPhase `json:"phase"`
+	// StartTime is the time at which the operation was started.
+	StartTime metav1.Time `json:"startTime"`
+	// CompletionTime is the time at which the operation completed (success or failure).
 	// +optional
-	Error *OnlineSnapshotError `json:"error,omitempty"`
-
-	// Progress reports how much data has been backed up
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+	// Duration is how long operation took to complete.
 	// +optional
-	Progress *BackupProgress `json:"progress,omitempty"`
-
-	// URL is the Restic repository path where the snapshot is stored
+	Duration string `json:"duration,omitempty"`
+	// Progress contains information about the progress of the operation.
 	// +optional
-	Repository string `json:"repository,omitempty"`
-
-	// SnapshotID is the unique Restic snapshot identifier
-	// +optional
-	SnapshotID string `json:"snapshotID,omitempty"`
-
-	// Paths are the paths that were backed up
-	// +optional
-	Paths []string `json:"paths,omitempty"`
-
+	Progress *OperationProgress `json:"progress,omitempty"`
 	// Message provides a short description of the snapshot’s state
 	// +optional
 	Message string `json:"message,omitempty"`
-
-	// StartTime is when the backup process began
+	// Error contains details if the operation encountered an error.
 	// +optional
-	StartTime *metav1.Time `json:"startTime,omitempty"`
-
-	// CompletionTime is when the backup finished (success or failure)
+	Error *SnapshotError `json:"error,omitempty"`
+	// Paths are the paths that were backed up or restored
 	// +optional
-	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
-
-	// Duration is how long the backup took
+	Paths []string `json:"paths,omitempty"`
+	// Repository is the Restic repository path where the snapshot is stored
 	// +optional
-	Duration string `json:"duration,omitempty"`
-
-	// RetryCount represents how many times this snapshot operation has retried (for controller logic)
+	Repository string `json:"repository,omitempty"`
+	// SnapshotID is the identifier of the Restic snapshot involved in the operation.
 	// +optional
-	RetryCount int `json:"retryCount,omitempty"`
-
+	SnapshotID string `json:"snapshotID,omitempty"`
 	// Version keeps track of restic binary or backup engine version used
 	// +optional
 	Version string `json:"version,omitempty"`
 }
 
-type OnlineSnapshotError struct {
+type OperationProgress struct {
+	// +optional
+	TotalBytes int64 `json:"totalBytes,omitempty"`
+
+	// +optional
+	BytesDone int64 `json:"bytesDone,omitempty"`
+
+	// Percentage can be calculated by controller or client (UploadedBytes / TotalBytes * 100)
+	// +optional
+	Percentage string `json:"percentage,omitempty"`
+}
+
+type SnapshotError struct {
 	Code    string `json:"code,omitempty"`    // e.g., "RepositoryNotReachable", "VolumeMountFailed"
 	Message string `json:"message,omitempty"` // human-readable error
 }
+
+//type OnlineSnapshotStatus struct {
+//	// Phase represents the current phase of the snapshot
+//	// +optional
+//	Phase SnapshotPhase `json:"phase,omitempty"`
+//
+//	// Error provides structured failure info if the snapshot failed
+//	// +optional
+//	Error *OnlineSnapshotError `json:"error,omitempty"`
+//
+//	// Progress reports how much data has been backed up
+//	// +optional
+//	Progress *BackupProgress `json:"progress,omitempty"`
+//
+//	// URL is the Restic repository path where the snapshot is stored
+//	// +optional
+//	Repository string `json:"repository,omitempty"`
+//
+//	// SnapshotID is the unique Restic snapshot identifier
+//	// +optional
+//	SnapshotID string `json:"snapshotID,omitempty"`
+//
+//	// Paths are the paths that were backed up
+//	// +optional
+//	Paths []string `json:"paths,omitempty"`
+//
+//	// Message provides a short description of the snapshot’s state
+//	// +optional
+//	Message string `json:"message,omitempty"`
+//
+//	// StartTime is when the backup process began
+//	// +optional
+//	StartTime *metav1.Time `json:"startTime,omitempty"`
+//
+//	// CompletionTime is when the backup finished (success or failure)
+//	// +optional
+//	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+//
+//	// Duration is how long the backup took
+//	// +optional
+//	Duration string `json:"duration,omitempty"`
+//
+//	// RetryCount represents how many times this snapshot operation has retried (for controller logic)
+//	// +optional
+//	RetryCount int `json:"retryCount,omitempty"`
+//
+//	// Version keeps track of restic binary or backup engine version used
+//	// +optional
+//	Version string `json:"version,omitempty"`
+//}
+
+//type OnlineSnapshotError struct {
+//	Code    string `json:"code,omitempty"`    // e.g., "RepositoryNotReachable", "VolumeMountFailed"
+//	Message string `json:"message,omitempty"` // human-readable error
+//}
 
 type BackupProgress struct {
 	// +optional
