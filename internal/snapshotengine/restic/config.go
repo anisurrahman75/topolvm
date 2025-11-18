@@ -190,6 +190,19 @@ func (w *ResticWrapper) GetRepo() string {
 	return ""
 }
 
+func (w *ResticWrapper) AddSuffixToRepository(suffix string) {
+	if w.sh != nil {
+		newRepository := filepath.Join(w.GetEnv(RESTIC_REPOSITORY), suffix)
+		w.sh.SetEnv(RESTIC_REPOSITORY, newRepository)
+	}
+}
+
+func (w *ResticWrapper) SetRepository(repo string) {
+	if w.sh != nil {
+		w.sh.SetEnv(RESTIC_REPOSITORY, repo)
+	}
+}
+
 // Copy function copy input ResticWrapper and returns a new wrapper with copy of its content.
 func (w *ResticWrapper) Copy() *ResticWrapper {
 	if w == nil {

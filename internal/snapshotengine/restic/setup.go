@@ -304,14 +304,6 @@ func (w *ResticWrapper) setupEnv() error {
 	return nil
 }
 
-func (w *ResticWrapper) AddSuffixToRepository(suffix string) {
-	newRepository := filepath.Join(w.GetEnv(RESTIC_REPOSITORY), suffix)
-
-	fmt.Println("New Repository:", newRepository)
-
-	w.sh.SetEnv(RESTIC_REPOSITORY, newRepository)
-}
-
 func (w *ResticWrapper) exportSecretKey(key string, required bool) error {
 	if v, ok := w.config.StorageSecret.Data[key]; !ok {
 		if required {

@@ -120,7 +120,7 @@ type SnapshotError struct {
 //
 //	// URL is the Restic repository path where the snapshot is stored
 //	// +optional
-//	Repository string `json:"repository,omitempty"`
+//	RepositorySuffix string `json:"repository,omitempty"`
 //
 //	// SnapshotID is the unique Restic snapshot identifier
 //	// +optional

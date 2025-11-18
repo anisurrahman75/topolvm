@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	v1 "github.com/topolvm/topolvm/api/v1"
 	"github.com/topolvm/topolvm/internal/filesystem"
@@ -103,6 +104,75 @@ func (m *LVMount) Mount(ctx context.Context, k8sLV *v1.LogicalVolume) (*MountRes
 	return resp, nil
 }
 
+// BindMount performs an idempotent bind mount of the LV.
+// This is useful for restore operations where the LV is already mounted by the pod.
+// It automatically finds the current mount point of the device and creates a bind mount.
+func (m *LVMount) BindMount(ctx context.Context, k8sLV *v1.LogicalVolume) (*MountResponse, error) {
+	resp := &MountResponse{}
+
+	lv, err := m.fetchLogicalVolume(ctx, k8sLV)
+	if err != nil {
+		return resp, err
+	}
+
+	devicePath := lv.GetPath()
+
+	// Find where the device is currently mounted
+	sourceMountPath, err := m.findMountPoint(devicePath)
+	if err != nil {
+		return m.fail(resp, fmt.Sprintf("failed to find mount point for device %s: %v", devicePath, err))
+	}
+
+	if sourceMountPath == "" {
+		return m.fail(resp, fmt.Sprintf("device %s is not currently mounted", devicePath))
+	}
+
+	mountPath := getMountPathFromLV(lv.GetName())
+
+	// For bind mount, the source is the existing mount point
+	// Use read-write mount for restore operations (no "ro" flag)
+	mountOptions := []string{"bind"}
+
+	resp.DevicePath = devicePath
+	resp.MountPath = mountPath
+	resp.FSType = "" // FSType is not needed for bind mounts
+	resp.MountOptions = mountOptions
+
+	mountLogger.Info("Bind mounting LV for restore",
+		"volume", k8sLV.Name,
+		"device", devicePath,
+		"source", sourceMountPath,
+		"mountPath", mountPath,
+		"options", mountOptions,
+	)
+
+	if err := m.prepareMountDir(mountPath); err != nil && !os.IsExist(err) {
+		return m.fail(resp, fmt.Sprintf("failed to create mount directory: %v", err))
+	}
+
+	alreadyMounted, err := m.checkAlreadyMounted(mountPath)
+	if err != nil {
+		return m.fail(resp, fmt.Sprintf("failed to check mount point: %v", err))
+	}
+	if alreadyMounted {
+		resp.AlreadyMounted = true
+		resp.Success = true
+		resp.Message = "LV already bind mounted"
+		mountLogger.Info("Already bind mounted", "target", mountPath)
+		return resp, nil
+	}
+
+	// Perform bind mount
+	if err := m.doMount(sourceMountPath, mountPath, "", mountOptions); err != nil {
+		return m.fail(resp, fmt.Sprintf("failed to bind mount %s to %s: %v", sourceMountPath, mountPath, err))
+	}
+
+	resp.Success = true
+	resp.Message = "Bind mount successful"
+	mountLogger.Info("Bind mounted successfully", "source", sourceMountPath, "target", mountPath)
+	return resp, nil
+}
+
 func (m *LVMount) fetchLogicalVolume(ctx context.Context, k8sLV *v1.LogicalVolume) (*proto.LogicalVolume, error) {
 	lv, err := m.getLogicalVolume(ctx, k8sLV.Spec.DeviceClass, k8sLV.Status.VolumeID)
 	if err != nil {
@@ -139,6 +209,35 @@ func (m *LVMount) fail(resp *MountResponse, msg string) (*MountResponse, error) 
 	resp.Success = false
 	resp.Message = msg
 	return resp, fmt.Errorf(msg)
+}
+
+// findMountPoint finds the mount point for a given device by parsing /proc/mounts
+func (m *LVMount) findMountPoint(devicePath string) (string, error) {
+	// Read /proc/mounts to find where the device is mounted
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return "", fmt.Errorf("failed to read /proc/mounts: %v", err)
+	}
+
+	// Parse the mount information
+	// Format: <device> <mount point> <fs type> <options> <dump> <pass>
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+
+		// Check if this is our device
+		if fields[0] == devicePath {
+			return fields[1], nil
+		}
+	}
+
+	return "", nil
 }
 
 func (m *LVMount) getLogicalVolume(ctx context.Context, deviceClass, volumeID string) (*proto.LogicalVolume, error) {

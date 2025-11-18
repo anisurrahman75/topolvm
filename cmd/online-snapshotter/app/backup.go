@@ -40,7 +40,7 @@ type BackupOptions struct {
 	snapshotStorage    *topolvmv1.OnlineSnapshotStorage
 }
 
-var opt = new(BackupOptions)
+var bOpt = new(BackupOptions)
 
 func newBackupCommand() *cobra.Command {
 	cmd := &cobra.Command{
@@ -50,15 +50,15 @@ func newBackupCommand() *cobra.Command {
 		It backs up the mounted filesystem to a remote repository using Restic or Kopia.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
-			opt.log = ctrl.Log.WithName("backup")
+			bOpt.log = ctrl.Log.WithName("backup")
 
-			if err := opt.initialize(ctx); err != nil {
-				opt.log.Error(err, "initialization failed")
+			if err := bOpt.initialize(ctx); err != nil {
+				bOpt.log.Error(err, "initialization failed")
 				return err
 			}
 
-			if err := opt.execute(ctx); err != nil {
-				opt.log.Error(err, "backup execution failed")
+			if err := bOpt.execute(ctx); err != nil {
+				bOpt.log.Error(err, "backup execution failed")
 				return err
 			}
 			return nil
@@ -72,15 +72,15 @@ func parseBackupFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&masterURL, "master", masterURL, "The address of the Kubernetes API server (overrides any value in kubeconfig)")
 	cmd.Flags().StringVar(&kubeconfigPath, "kubeconfig", kubeconfigPath, "Path to kubeconfig file with authorization information (the master location is set by the master flag)")
 
-	cmd.Flags().StringVar(&opt.lvName, "lv-name", "", "Name of the logical volume to backup (required)")
-	cmd.Flags().StringVar(&opt.nodeName, "node-name", "", "Node name where the logical volume resides (required)")
-	cmd.Flags().StringVar(&opt.mountPath, "mount-path", "", "Mount path of the logical volume (required)")
+	cmd.Flags().StringVar(&bOpt.lvName, "lv-name", "", "Name of the logical volume to backup (required)")
+	cmd.Flags().StringVar(&bOpt.nodeName, "node-name", "", "Node name where the logical volume resides (required)")
+	cmd.Flags().StringVar(&bOpt.mountPath, "mount-path", "", "Mount path of the logical volume (required)")
 
-	cmd.Flags().StringVar(&opt.targetedPVCRef.Namespace, "targeted-pvc-namespace", "", "Namespace of the targeted PVC")
-	cmd.Flags().StringVar(&opt.targetedPVCRef.Name, "targeted-pvc-name", "", "Name of the targeted PVC")
+	cmd.Flags().StringVar(&bOpt.targetedPVCRef.Namespace, "targeted-pvc-namespace", "", "Namespace of the targeted PVC")
+	cmd.Flags().StringVar(&bOpt.targetedPVCRef.Name, "targeted-pvc-name", "", "Name of the targeted PVC")
 
-	cmd.Flags().StringVar(&opt.snapshotStorageRef.Namespace, "snapshot-storage-namespace", "", "Namespace of the OnlineSnapshotStorage CR")
-	cmd.Flags().StringVar(&opt.snapshotStorageRef.Name, "snapshot-storage-name", "", "Name of the OnlineSnapshotStorage CR")
+	cmd.Flags().StringVar(&bOpt.snapshotStorageRef.Namespace, "snapshot-storage-namespace", "", "Namespace of the OnlineSnapshotStorage CR")
+	cmd.Flags().StringVar(&bOpt.snapshotStorageRef.Name, "snapshot-storage-name", "", "Name of the OnlineSnapshotStorage CR")
 }
 
 func (opt *BackupOptions) initialize(ctx context.Context) error {
@@ -172,10 +172,15 @@ func (opt *BackupOptions) getBackupProvider() (provider.Provider, error) {
 }
 
 func (opt *BackupOptions) executeBackup(ctx context.Context, pvider provider.Provider) (*provider.BackupResult, error) {
-	backupParams := opt.buildBackupParams()
-	opt.log.Info("executing backup with params", "repository", backupParams.Repository, "paths", backupParams.BackupPaths)
+	params := opt.buildBackupParams()
+	opt.log.Info("executing backup with params",
+		"repository", params.Suffix,
+		"paths", params.BackupPaths,
+		"exclude", params.Exclude,
+		"args", params.Args,
+	)
 
-	result, err := pvider.Backup(ctx, backupParams)
+	result, err := pvider.Backup(ctx, params)
 	if err != nil {
 		return nil, fmt.Errorf("backup operation failed: %w", err)
 	}
@@ -217,9 +222,9 @@ func (opt *BackupOptions) handleBackupSuccess(ctx context.Context, result *provi
 
 func (opt *BackupOptions) buildBackupParams() provider.BackupParam {
 	return provider.BackupParam{
-		RepoParam: provider.RepoParam{
-			Repository: filepath.Join(opt.targetedPVCRef.Namespace, opt.targetedPVCRef.Name),
-			Hostname:   hostname,
+		RepoRef: provider.RepoRef{
+			Suffix:   filepath.Join(opt.targetedPVCRef.Namespace, opt.targetedPVCRef.Name),
+			Hostname: hostname,
 		},
 		BackupPaths: []string{opt.mountPath},
 	}

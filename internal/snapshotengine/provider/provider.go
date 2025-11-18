@@ -5,16 +5,18 @@ import (
 	"time"
 )
 
-// RepoParam includes the parameters to manipulate a backup repository
-type RepoParam struct {
-	RepoFullPath string // It only uses to set the backup/restore result
-	Repository   string
-	Hostname     string
+// RepoRef includes the parameters to manipulate a backup repository
+type RepoRef struct {
+	Repository *string // Only use when redefining the repository
+
+	FullPath string // It only uses to set the backup/restore result
+	Suffix   string // It'll add as a suffix e.g, bucket/prefix/repositorySuffix
+	Hostname string
 }
 
 // BackupParam includes parameters for backup operations
 type BackupParam struct {
-	RepoParam
+	RepoRef
 	BackupPaths []string
 	Exclude     []string
 	Args        []string
@@ -22,7 +24,7 @@ type BackupParam struct {
 
 // RestoreParam includes parameters for restore operations
 type RestoreParam struct {
-	RepoParam
+	RepoRef
 	SnapshotID   string
 	RestorePaths []string
 	Destination  string
@@ -88,12 +90,65 @@ type BackupResult struct {
 	Version string `json:"version,omitempty"`
 }
 
+/*
+
+type HostRestoreStats struct {
+	// Hostname indicate name of the host that has been restored
+	// +optional
+	Hostname string `json:"hostname,omitempty"`
+	// Phase indicates restore phase of this host
+	// +optional
+	Phase HostRestorePhase `json:"phase,omitempty"`
+	// Duration indicates total time taken to complete restore for this hosts
+	// +optional
+	Duration string `json:"duration,omitempty"`
+	// Error indicates string value of error in case of restore failure
+	// +optional
+	Error string `json:"error,omitempty"`
+}
+
+*/
+
+// RestoreResult contains the result of a restore operation
+// This is a generic structure that works for both Restic and Kopia
+type RestoreResult struct {
+	// Hostname indicate name of the host that has been restored
+	// +optional
+	Hostname string `json:"hostname,omitempty"`
+
+	// Phase indicates restore phase of this host
+	// +optional
+	Phase RestorePhase `json:"phase,omitempty"`
+
+	// Repository is the backup repository URL/path
+	Repository string `json:"repository,omitempty"`
+
+	// RestoreTime is when the restore was started
+	RestoreTime time.Time `json:"backupTime,omitempty"`
+
+	// Duration is how long the restore took
+	Duration string `json:"duration,omitempty"`
+
+	// ErrorMessage contains error details if restore failed
+	ErrorMessage string `json:"errorMessage,omitempty"`
+
+	// Provider identifies the backup engine used (restic, kopia)
+	Provider string `json:"provider,omitempty"`
+}
+
 // BackupPhase represents the phase of backup operation
 type BackupPhase string
 
 const (
 	BackupPhaseSucceeded BackupPhase = "Succeeded"
 	BackupPhaseFailed    BackupPhase = "Failed"
+)
+
+type RestorePhase string
+
+const (
+	RestoreSucceeded RestorePhase = "Succeeded"
+	RestoreFailed    RestorePhase = "Failed"
 )
 
 // BackupSizeInfo contains size-related statistics
@@ -104,10 +159,10 @@ type BackupSizeInfo struct {
 	// UploadedBytes is the amount of data actually uploaded (may be less due to deduplication)
 	UploadedBytes int64 `json:"uploadedBytes,omitempty"`
 
-	// TotalFormatted is human-readable total size (e.g., "1.5 GiB")
+	// TotalFormatted is a human-readable total size (e.g., "1.5 GiB")
 	TotalFormatted string `json:"totalFormatted,omitempty"`
 
-	// UploadedFormatted is human-readable uploaded size
+	// UploadedFormatted is a human-readable uploaded size
 	UploadedFormatted string `json:"uploadedFormatted,omitempty"`
 }
 
@@ -134,23 +189,26 @@ type Provider interface {
 	// Backup creates a new snapshot and returns detailed backup result
 	Backup(ctx context.Context, param BackupParam) (*BackupResult, error)
 
+	// Restore restores files from a snapshot
+	Restore(ctx context.Context, param RestoreParam) (*RestoreResult, error)
+
 	// Backup // InitRepo initializes a new repository in the storage backend
-	//InitRepo(ctx context.Context, param RepoParam) error
+	//InitRepo(ctx context.Context, param RepoRef) error
 	//
 	//// ConnectToRepo establishes connection to an existing repository
-	//ConnectToRepo(ctx context.Context, param RepoParam) error
+	//ConnectToRepo(ctx context.Context, param RepoRef) error
 	//
 	//// PrepareRepo combines InitRepo and ConnectToRepo - initializes if needed, connects otherwise
-	//PrepareRepo(ctx context.Context, param RepoParam) error
+	//PrepareRepo(ctx context.Context, param RepoRef) error
 	//
 	//// BoostRepoConnect re-ensures local connection to the repo (useful after pod restarts)
-	//BoostRepoConnect(ctx context.Context, param RepoParam) error
+	//BoostRepoConnect(ctx context.Context, param RepoRef) error
 	//
 	//// EnsureUnlockRepo removes any stale file locks in the storage
-	//EnsureUnlockRepo(ctx context.Context, param RepoParam) error
+	//EnsureUnlockRepo(ctx context.Context, param RepoRef) error
 	//
 	//// PruneRepo performs full maintenance/pruning of the repository
-	//PruneRepo(ctx context.Context, param RepoParam) error
+	//PruneRepo(ctx context.Context, param RepoRef) error
 
 	//
 	//// Restore restores files from a snapshot
@@ -159,25 +217,25 @@ type Provider interface {
 	//// Snapshot Management
 	//
 	//// ListSnapshots lists all snapshots in the repository
-	//ListSnapshots(ctx context.Context, param RepoParam) ([]SnapshotInfo, error)
+	//ListSnapshots(ctx context.Context, param RepoRef) ([]SnapshotInfo, error)
 	//
 	//// DeleteSnapshot deletes a specific snapshot by ID
-	//DeleteSnapshot(ctx context.Context, snapshotID string, param RepoParam) error
+	//DeleteSnapshot(ctx context.Context, snapshotID string, param RepoRef) error
 	//
 	//// Forget removes a snapshot from the repository (alias for DeleteSnapshot)
-	//Forget(ctx context.Context, snapshotID string, param RepoParam) error
+	//Forget(ctx context.Context, snapshotID string, param RepoRef) error
 	//
 	//// BatchForget removes multiple snapshots
-	//BatchForget(ctx context.Context, snapshotIDs []string, param RepoParam) []error
+	//BatchForget(ctx context.Context, snapshotIDs []string, param RepoRef) []error
 	//
 	//// CheckRepository verifies the repository integrity
-	//CheckRepository(ctx context.Context, param RepoParam) error
+	//CheckRepository(ctx context.Context, param RepoRef) error
 	//
 	//// Stats & Maintenance
 	//
 	//// DefaultMaintenanceFrequency returns the default frequency to run maintenance
-	//DefaultMaintenanceFrequency(ctx context.Context, param RepoParam) time.Duration
+	//DefaultMaintenanceFrequency(ctx context.Context, param RepoRef) time.Duration
 	//
 	//// GetRepositoryStats returns statistics about the repository
-	//GetRepositoryStats(ctx context.Context, param RepoParam) (*RepositoryStats, error)
+	//GetRepositoryStats(ctx context.Context, param RepoRef) (*RepositoryStats, error)
 }

@@ -56,7 +56,7 @@ func NewSnapshotExecutor(
 // Execute creates a snapshot pod that will perform the online snapshot operation.
 func (e *SnapshotExecutor) Execute() error {
 	objMeta := e.buildObjectMeta()
-	hostPod, err := e.getHostPod()
+	hostPod, err := getHostPod(e.client)
 	if err != nil {
 		return err
 	}
@@ -76,7 +76,7 @@ func (e *SnapshotExecutor) Execute() error {
 		Spec:       podSpec,
 	}
 
-	err = e.CreateSnapshotPod(pod)
+	err = e.createSnapshotPod(pod)
 	return err
 }
 
@@ -107,7 +107,7 @@ func (e *SnapshotExecutor) setTargetedPVCInfo() error {
 	return nil
 }
 
-func (e *SnapshotExecutor) CreateSnapshotPod(pod *corev1.Pod) error {
+func (e *SnapshotExecutor) createSnapshotPod(pod *corev1.Pod) error {
 	existingPod := new(corev1.Pod)
 	err := e.client.Get(context.Background(), client.ObjectKeyFromObject(pod), existingPod)
 	if err != nil {
@@ -129,7 +129,7 @@ func (e *SnapshotExecutor) CreateSnapshotPod(pod *corev1.Pod) error {
 // (via owner reference) and replacing containers with the snapshot container.
 // The affinity is taken from the actual running pod, not the DaemonSet template.
 func (e *SnapshotExecutor) buildPodSpec(hostPod *corev1.Pod) (corev1.PodSpec, error) {
-	daemonSet, err := e.getDaemonSetFromOwnerRef(hostPod)
+	daemonSet, err := getDaemonSetFromOwnerRef(e.client, hostPod)
 	if err != nil {
 		return corev1.PodSpec{}, err
 	}
@@ -163,7 +163,7 @@ func (e *SnapshotExecutor) buildPodSpec(hostPod *corev1.Pod) (corev1.PodSpec, er
 }
 
 // getHostPod retrieves the current pod running this executor.
-func (e *SnapshotExecutor) getHostPod() (*corev1.Pod, error) {
+func getHostPod(rClient client.Client) (*corev1.Pod, error) {
 	hostPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      os.Getenv(EnvHostName),
@@ -171,7 +171,7 @@ func (e *SnapshotExecutor) getHostPod() (*corev1.Pod, error) {
 		},
 	}
 
-	if err := e.client.Get(context.Background(), client.ObjectKeyFromObject(hostPod), hostPod); err != nil {
+	if err := rClient.Get(context.Background(), client.ObjectKeyFromObject(hostPod), hostPod); err != nil {
 		return nil, fmt.Errorf("failed to get host pod: %w", err)
 	}
 
@@ -179,7 +179,7 @@ func (e *SnapshotExecutor) getHostPod() (*corev1.Pod, error) {
 }
 
 // getDaemonSetFromOwnerRef retrieves the DaemonSet from the pod's owner reference.
-func (e *SnapshotExecutor) getDaemonSetFromOwnerRef(pod *corev1.Pod) (*appsv1.DaemonSet, error) {
+func getDaemonSetFromOwnerRef(rClient client.Client, pod *corev1.Pod) (*appsv1.DaemonSet, error) {
 	// Find the DaemonSet owner reference
 	var daemonSetRef *metav1.OwnerReference
 	for i := range pod.OwnerReferences {
@@ -201,7 +201,7 @@ func (e *SnapshotExecutor) getDaemonSetFromOwnerRef(pod *corev1.Pod) (*appsv1.Da
 		},
 	}
 
-	if err := e.client.Get(context.Background(), client.ObjectKeyFromObject(daemonSet), daemonSet); err != nil {
+	if err := rClient.Get(context.Background(), client.ObjectKeyFromObject(daemonSet), daemonSet); err != nil {
 		return nil, fmt.Errorf("failed to get DaemonSet %s/%s: %w", pod.Namespace, daemonSetRef.Name, err)
 	}
 
@@ -300,23 +300,17 @@ func (e *SnapshotExecutor) buildResourceRequirements() corev1.ResourceRequiremen
 // buildObjectMeta constructs the metadata for the snapshot pod.
 func (e *SnapshotExecutor) buildObjectMeta() metav1.ObjectMeta {
 	return metav1.ObjectMeta{
-		Name:        e.generateSnapshotPodName(),
-		Namespace:   e.getNamespace(),
-		Labels:      e.buildLabels(),
-		Annotations: e.buildAnnotations(),
+		Name:        fmt.Sprintf("%s-snapshot", e.logicalVolume.Name),
+		Namespace:   getNamespace(),
+		Labels:      buildLabels(e.logicalVolume),
+		Annotations: buildAnnotations(e.logicalVolume),
 		OwnerReferences: []metav1.OwnerReference{
 			*metav1.NewControllerRef(e.logicalVolume, topolvmv1.GroupVersion.WithKind("LogicalVolume")),
 		},
 	}
 }
 
-// generateSnapshotPodName generates a unique name for the snapshot pod.
-func (e *SnapshotExecutor) generateSnapshotPodName() string {
-	return fmt.Sprintf("%s-snapshot", e.logicalVolume.Name)
-}
-
-// getNamespace returns the namespace where the snapshot pod should be created.
-func (e *SnapshotExecutor) getNamespace() string {
+func getNamespace() string {
 	namespace := os.Getenv(EnvHostNamespace)
 	if namespace == "" {
 		namespace = "topolvm-system"
@@ -325,10 +319,10 @@ func (e *SnapshotExecutor) getNamespace() string {
 }
 
 // buildLabels constructs labels for the snapshot pod.
-func (e *SnapshotExecutor) buildLabels() map[string]string {
+func buildLabels(lv *topolvmv1.LogicalVolume) map[string]string {
 	labels := map[string]string{
 		LabelAppKey:           LabelAppValue,
-		LabelLogicalVolumeKey: e.logicalVolume.Name,
+		LabelLogicalVolumeKey: lv.Name,
 		LabelSnapshotPodKey:   "true",
 	}
 
@@ -336,10 +330,10 @@ func (e *SnapshotExecutor) buildLabels() map[string]string {
 }
 
 // buildAnnotations constructs annotations for the snapshot pod.
-func (e *SnapshotExecutor) buildAnnotations() map[string]string {
+func buildAnnotations(lv *topolvmv1.LogicalVolume) map[string]string {
 	annotations := map[string]string{
-		"topolvm.io/snapshot-source":  e.logicalVolume.Spec.Source,
-		"topolvm.io/device-class":     e.logicalVolume.Spec.DeviceClass,
+		"topolvm.io/snapshot-source":  lv.Spec.Source,
+		"topolvm.io/device-class":     lv.Spec.DeviceClass,
 		"topolvm.io/snapshot-version": "v1",
 	}
 	return annotations
