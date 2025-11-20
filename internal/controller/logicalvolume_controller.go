@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	snapshot_api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
@@ -15,6 +16,7 @@ import (
 	"github.com/topolvm/topolvm/pkg/lvmd/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,7 +47,7 @@ func NewLogicalVolumeReconcilerWithServices(client client.Client, nodeName strin
 		nodeName:  nodeName,
 		vgService: vgService,
 		lvService: lvService,
-		lvMount:   mounter.NewLVMount(vgService, lvService),
+		lvMount:   mounter.NewLVMount(client, vgService, lvService),
 	}
 }
 
@@ -104,8 +106,32 @@ func (r *LogicalVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{RequeueAfter: requeueIntervalForSimpleUpdate}, nil
 		}
 
+		snapshotLV, err := r.getSnapshotLV(ctx, lv)
+		if err != nil {
+			log.Error(err, "failed to get snapshot LV", "name", lv.Name)
+			return ctrl.Result{}, err
+		}
+
+		var restoreFmSnap bool
+		var vsClass *snapshot_api.VolumeSnapshotClass
+		var vsContent *snapshot_api.VolumeSnapshotContent
+
+		if snapshotLV != nil {
+			log.Info("snapshot LV found", "name", snapshotLV.Name)
+			vsContent, vsClass, err = r.getVSContentAndClassIfExist(ctx, snapshotLV)
+			if err != nil {
+				log.Error(err, "failed to get VolumeSnapshotContent and VolumeSnapshotClass", "name", lv.Name)
+				return ctrl.Result{}, err
+			}
+			restoreFmSnap, err = r.shouldRestoreFromSnapshot(snapshotLV, vsClass)
+			if err != nil {
+				log.Error(err, "failed to check whether to restore from snapshot", "name", lv.Name)
+				return ctrl.Result{}, err
+			}
+		}
+
 		if lv.Status.VolumeID == "" {
-			err := r.createLV(ctx, log, lv)
+			err := r.createLV(ctx, log, lv, restoreFmSnap)
 			if err != nil {
 				log.Error(err, "failed to create LV", "name", lv.Name)
 			}
@@ -118,33 +144,32 @@ func (r *LogicalVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				return ctrl.Result{}, err
 			}
 		}
-		var vsContent *snapshot_api.VolumeSnapshotContent
-		var vsClass *snapshot_api.VolumeSnapshotClass
 
-		snapshotLV, err := r.getSnapshotLV(ctx, lv)
-		if err != nil {
-			log.Error(err, "failed to get snapshot LV", "name", lv.Name)
-			return ctrl.Result{}, err
-		}
-		if snapshotLV != nil {
-			log.Info("snapshot LV found", "name", snapshotLV.Name)
-			vsContent, vsClass, err = r.getVSContentAndClassIfExist(ctx, snapshotLV)
+		if restoreFmSnap {
+			exist, err := r.ensurePVExist(lv)
 			if err != nil {
-				log.Error(err, "failed to get VolumeSnapshotContent and VolumeSnapshotClass", "name", lv.Name)
+				log.Error(err, "failed to check whether PV exists", "name", lv.Name)
 				return ctrl.Result{}, err
 			}
-			yes, err := r.shouldRestoreFromSnapshot(snapshotLV, vsClass)
+			if !exist {
+				log.Info("PV doesn't exist yet, waiting for it to be created", "name", lv.Name)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			err = r.restoreFromSnapshot(ctx, log, lv, snapshotLV, vsClass)
 			if err != nil {
-				log.Error(err, "failed to check whether to restore from snapshot", "name", lv.Name)
 				return ctrl.Result{}, err
 			}
-			if yes {
-				err := r.restoreFromSnapshot(ctx, log, lv, snapshotLV, vsClass)
-				if err != nil {
+
+			if lv.Status.Snapshot != nil && lv.Status.Snapshot.Phase == topolvmv1.OperationPhaseSucceeded {
+				log.Info("snapshot restore completed successfully", "name", lv.Name)
+				if err := r.lvMount.Unmount(ctx, lv); err != nil {
+					log.Error(err, "failed to unmount LV", "name", lv.Name)
 					return ctrl.Result{}, err
 				}
+				log.Info("successfully unmounted LV", "name", lv.Name, "uid", lv.UID)
 			}
 		}
+
 		vsContent, vsClass, err = r.getVSContentAndClassIfExist(ctx, lv)
 		if err != nil {
 			log.Error(err, "failed to get VolumeSnapshotContent and VolumeSnapshotClass", "name", lv.Name)
@@ -185,6 +210,22 @@ func (r *LogicalVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *LogicalVolumeReconciler) ensurePVExist(lv *topolvmv1.LogicalVolume) (bool, error) {
+	if lv.Spec.Name == "" {
+		return false, nil
+	}
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: lv.Spec.Name,
+		},
+	}
+	err := r.client.Get(context.Background(), client.ObjectKeyFromObject(pv), pv)
+	if err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	return true, nil
 }
 
 func (r *LogicalVolumeReconciler) getVSClassFromContent(ctx context.Context, content *snapshot_api.VolumeSnapshotContent) (*snapshot_api.VolumeSnapshotClass, error) {
@@ -266,6 +307,13 @@ func (r *LogicalVolumeReconciler) shouldRestoreFromSnapshot(snapshotLv *topolvmv
 
 func (r *LogicalVolumeReconciler) takeSnapshot(ctx context.Context, log logr.Logger, lv *topolvmv1.LogicalVolume,
 	vsContent *snapshot_api.VolumeSnapshotContent, vsClass *snapshot_api.VolumeSnapshotClass) error {
+
+	//// Refresh the LV to get the latest status
+	//if err := r.client.Get(ctx, client.ObjectKeyFromObject(lv), lv); err != nil {
+	//	log.Error(err, "failed to get latest LogicalVolume", "name", lv.Name)
+	//	return err
+	//}
+
 	if lv.Status.Snapshot == nil || lv.Status.Snapshot.Phase == "" {
 		msg := fmt.Sprintf("Initializing online snapshot")
 		if err := r.updateSnapshotStatus(ctx, lv, topolvmv1.OperationBackup, topolvmv1.OperationPhasePending, msg, nil); err != nil {
@@ -286,7 +334,7 @@ func (r *LogicalVolumeReconciler) takeSnapshot(ctx context.Context, log logr.Log
 		return nil
 	}
 
-	resp, err := r.lvMount.Mount(ctx, lv)
+	resp, err := r.lvMount.Mount(ctx, lv, []string{"ro", "norecovery"})
 	if err != nil {
 		log.Error(err, "failed to mount LV", "name", lv.Name)
 		// Set the failed phase with the mount error
@@ -323,6 +371,17 @@ func (r *LogicalVolumeReconciler) takeSnapshot(ctx context.Context, log logr.Log
 
 func (r *LogicalVolumeReconciler) restoreFromSnapshot(ctx context.Context, log logr.Logger, lv *topolvmv1.LogicalVolume,
 	snapshotLv *topolvmv1.LogicalVolume, vsClass *snapshot_api.VolumeSnapshotClass) error {
+	//// Refresh the LV to get the latest status
+	//if err := r.client.Get(ctx, client.ObjectKeyFromObject(lv), lv); err != nil {
+	//	log.Error(err, "failed to get latest LogicalVolume", "name", lv.Name)
+	//	return err
+	//}
+	if lv.Status.Snapshot != nil && (lv.Status.Snapshot.Phase == topolvmv1.OperationPhaseSucceeded ||
+		lv.Status.Snapshot.Phase == topolvmv1.OperationPhaseFailed) {
+		log.Info("online restore already processed", "name", lv.Name, "phase", lv.Status.Snapshot.Phase)
+		return nil
+	}
+
 	if lv.Status.Snapshot == nil || lv.Status.Snapshot.Phase == "" {
 		msg := fmt.Sprintf("Initializing online restore")
 		if err := r.updateSnapshotStatus(ctx, lv, topolvmv1.OperationRestore, topolvmv1.OperationPhasePending, msg, nil); err != nil {
@@ -332,19 +391,13 @@ func (r *LogicalVolumeReconciler) restoreFromSnapshot(ctx context.Context, log l
 		log.Info("updated online restore status", "name", lv.Name, "phase", topolvmv1.OperationPhasePending, "message", msg)
 	}
 
-	if lv.Status.Snapshot.Phase == topolvmv1.OperationPhaseSucceeded ||
-		lv.Status.Snapshot.Phase == topolvmv1.OperationPhaseFailed {
-		log.Info("online restore already processed", "name", lv.Name, "phase", lv.Status.Snapshot.Phase)
-		return nil
-	}
-
 	if lv.Status.Snapshot.Phase == topolvmv1.OperationPhaseRunning {
 		log.Info("online restore is currently running", "name", lv.Name)
 		return nil
 	}
 
 	// Use bind mount for restore since the LV is already mounted by the pod
-	resp, err := r.lvMount.Mount(ctx, lv)
+	resp, err := r.lvMount.Mount(ctx, lv, []string{})
 	if err != nil {
 		log.Error(err, "failed to bind mount LV", "name", lv.Name)
 		// Set the failed phase with the mount error
@@ -409,26 +462,37 @@ func (r *LogicalVolumeReconciler) getVSClass(ctx context.Context, content *snaps
 
 func (r *LogicalVolumeReconciler) updateSnapshotStatus(ctx context.Context, lv *topolvmv1.LogicalVolume,
 	opType topolvmv1.OperationType, phase topolvmv1.OperationPhase, message string, snapshotErr *topolvmv1.SnapshotError) error {
+	// Refresh the LogicalVolume object to get the latest version
+	freshLV := &topolvmv1.LogicalVolume{}
+	if err := r.client.Get(ctx, client.ObjectKeyFromObject(lv), freshLV); err != nil {
+		return fmt.Errorf("failed to get latest LogicalVolume: %v", err)
+	}
+
 	// Initialize OnlineSnapshot status if it doesn't exist
-	if lv.Status.Snapshot == nil {
-		lv.Status.Snapshot = &topolvmv1.SnapshotStatus{}
-		lv.Status.Snapshot.StartTime = metav1.Now()
+	if freshLV.Status.Snapshot == nil {
+		freshLV.Status.Snapshot = &topolvmv1.SnapshotStatus{}
+		freshLV.Status.Snapshot.StartTime = metav1.Now()
 	}
 
 	// Update phase and message
-	lv.Status.Snapshot.Operation = opType
-	lv.Status.Snapshot.Phase = phase
-	lv.Status.Snapshot.Message = message
+	freshLV.Status.Snapshot.Operation = opType
+	freshLV.Status.Snapshot.Phase = phase
+	freshLV.Status.Snapshot.Message = message
 
 	// Set error if provided
 	if snapshotErr != nil {
-		lv.Status.Snapshot.Error = snapshotErr
+		freshLV.Status.Snapshot.Error = snapshotErr
 	}
 
 	// Update the status
-	if err := r.client.Status().Update(ctx, lv); err != nil {
+	if err := r.client.Status().Update(ctx, freshLV); err != nil {
 		return err
 	}
+
+	// Update the original lv object with the latest status to keep it in sync
+	lv.Status = freshLV.Status
+	lv.ObjectMeta.ResourceVersion = freshLV.ObjectMeta.ResourceVersion
+
 	return nil
 }
 
@@ -497,7 +561,7 @@ func (r *LogicalVolumeReconciler) volumeExists(ctx context.Context, log logr.Log
 	return false, nil
 }
 
-func (r *LogicalVolumeReconciler) createLV(ctx context.Context, log logr.Logger, lv *topolvmv1.LogicalVolume) error {
+func (r *LogicalVolumeReconciler) createLV(ctx context.Context, log logr.Logger, lv *topolvmv1.LogicalVolume, restoreFrSnapshot bool) error {
 	// When lv.Status.Code is not codes.OK (== 0), CreateLV has already failed.
 	// LogicalVolume CRD will be deleted soon by the controller.
 	if lv.Status.Code != codes.OK {
@@ -526,7 +590,7 @@ func (r *LogicalVolumeReconciler) createLV(ctx context.Context, log logr.Logger,
 		var volume *proto.LogicalVolume
 
 		// Create a snapshot LV
-		if lv.Spec.Source != "" {
+		if lv.Spec.Source != "" && !restoreFrSnapshot {
 			// accessType should be either "readonly" or "readwrite".
 			if lv.Spec.AccessType != "ro" && lv.Spec.AccessType != "rw" {
 				return fmt.Errorf("invalid access type for source volume: %s", lv.Spec.AccessType)

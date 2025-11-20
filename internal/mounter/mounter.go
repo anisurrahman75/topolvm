@@ -12,16 +12,20 @@ import (
 	"github.com/topolvm/topolvm/pkg/lvmd/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	mountutil "k8s.io/mount-utils"
 	utilexec "k8s.io/utils/exec"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var mountLogger = ctrl.Log.WithName("driver").WithName("mounter")
 
 type LVMount struct {
 	nodeName  string
-	client    proto.VGServiceClient
+	client    client.Client
+	vgClient  proto.VGServiceClient
 	lvService proto.LVServiceClient
 	mounter   mountutil.SafeFormatAndMount
 }
@@ -36,9 +40,10 @@ type MountResponse struct {
 	Message        string
 }
 
-func NewLVMount(vgService proto.VGServiceClient, lvService proto.LVServiceClient) *LVMount {
+func NewLVMount(client client.Client, vgService proto.VGServiceClient, lvService proto.LVServiceClient) *LVMount {
 	return &LVMount{
-		client:    vgService,
+		client:    client,
+		vgClient:  vgService,
 		lvService: lvService,
 		mounter: mountutil.SafeFormatAndMount{
 			Interface: mountutil.New(""),
@@ -48,9 +53,8 @@ func NewLVMount(vgService proto.VGServiceClient, lvService proto.LVServiceClient
 }
 
 // Mount performs an idempotent mount of the LV snapshot.
-func (m *LVMount) Mount(ctx context.Context, k8sLV *v1.LogicalVolume) (*MountResponse, error) {
+func (m *LVMount) Mount(ctx context.Context, k8sLV *v1.LogicalVolume, mountOpts []string) (*MountResponse, error) {
 	resp := &MountResponse{}
-
 	lv, err := m.fetchLogicalVolume(ctx, k8sLV)
 	if err != nil {
 		return resp, err
@@ -64,19 +68,28 @@ func (m *LVMount) Mount(ctx context.Context, k8sLV *v1.LogicalVolume) (*MountRes
 		return resp, fmt.Errorf("failed to detect filesystem for LV %s: %v", k8sLV.Name, err)
 	}
 
-	mountOptions := []string{"ro", "norecovery"}
+	// Default to ext4 if no filesystem is detected
+	if fsType == "" {
+		fsType, err = m.getFSTypeFromPV(k8sLV)
+		if err != nil {
+			return resp, fmt.Errorf("failed to get FSType from StorageClass: %v", err)
+		}
+	}
+	if fsType == "" {
+		return m.fail(resp, "failed to detect filesystem for LV snapshot")
+	}
 
 	resp.DevicePath = devicePath
 	resp.MountPath = mountPath
 	resp.FSType = fsType
-	resp.MountOptions = mountOptions
+	resp.MountOptions = mountOpts
 
 	mountLogger.Info("Mounting LV snapshot",
 		"volume", k8sLV.Name,
 		"device", devicePath,
 		"mountPath", mountPath,
 		"fsType", fsType,
-		"options", mountOptions,
+		"options", mountOpts,
 	)
 
 	if err := m.prepareMountDir(mountPath); err != nil && !os.IsExist(err) {
@@ -94,7 +107,7 @@ func (m *LVMount) Mount(ctx context.Context, k8sLV *v1.LogicalVolume) (*MountRes
 		mountLogger.Info("Already mounted", "target", mountPath)
 		return resp, nil
 	}
-	if err := m.doMount(devicePath, mountPath, fsType, mountOptions); err != nil {
+	if err := m.doMount(devicePath, mountPath, fsType, mountOpts); err != nil {
 		return m.fail(resp, fmt.Sprintf("failed to mount %s: %v", devicePath, err))
 	}
 
@@ -102,6 +115,21 @@ func (m *LVMount) Mount(ctx context.Context, k8sLV *v1.LogicalVolume) (*MountRes
 	resp.Message = "Snapshot mounted successfully"
 	mountLogger.Info("Mounted successfully", "device", devicePath, "target", mountPath)
 	return resp, nil
+}
+
+func (m *LVMount) getFSTypeFromPV(k8sLv *v1.LogicalVolume) (string, error) {
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: k8sLv.Spec.Name,
+		},
+	}
+	if err := m.client.Get(context.TODO(), client.ObjectKeyFromObject(pv), pv); err != nil {
+		return "", err
+	}
+	if pv.Spec.CSI == nil {
+		return "", fmt.Errorf("PV %s has no CSI spec", pv.Name)
+	}
+	return pv.Spec.CSI.FSType, nil
 }
 
 // BindMount performs an idempotent bind mount of the LV.
@@ -202,6 +230,53 @@ func (m *LVMount) checkAlreadyMounted(target string) (bool, error) {
 }
 
 func (m *LVMount) doMount(device, target, fsType string, options []string) error {
+	return m.mounter.FormatAndMount(device, target, fsType, options)
+}
+
+func (m *LVMount) doFormatAndMount(device, target, fsType string, options []string) error {
+	// Check if device is already formatted
+	existingFormat, err := filesystem.DetectFilesystem(device)
+	if err != nil {
+		return fmt.Errorf("failed to detect filesystem: %v", err)
+	}
+
+	// If device is not formatted, format it first
+	if existingFormat == "" {
+		mountLogger.Info("Device is unformatted, formatting now",
+			"device", device,
+			"fsType", fsType,
+		)
+
+		// Format the device using mkfs
+		// We need to format without the read-only option
+		var args []string
+		if fsType == "ext4" || fsType == "ext3" {
+			args = []string{
+				"-F",  // Force flag
+				"-m0", // Zero blocks reserved for super-user
+				device,
+			}
+		} else if fsType == "xfs" {
+			args = []string{
+				"-f", // force flag
+				device,
+			}
+		} else {
+			args = []string{device}
+		}
+
+		output, err := m.mounter.Exec.Command("mkfs."+fsType, args...).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to format device %s as %s: %v, output: %s", device, fsType, err, string(output))
+		}
+
+		mountLogger.Info("Device formatted successfully",
+			"device", device,
+			"fsType", fsType,
+		)
+	}
+
+	// Now mount with the requested options (including ro if specified)
 	return m.mounter.Mount(device, target, fsType, options)
 }
 
@@ -241,7 +316,7 @@ func (m *LVMount) findMountPoint(devicePath string) (string, error) {
 }
 
 func (m *LVMount) getLogicalVolume(ctx context.Context, deviceClass, volumeID string) (*proto.LogicalVolume, error) {
-	listResp, err := m.client.GetLVList(ctx, &proto.GetLVListRequest{DeviceClass: deviceClass})
+	listResp, err := m.vgClient.GetLVList(ctx, &proto.GetLVListRequest{DeviceClass: deviceClass})
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to list LV: %v", err)
 	}
