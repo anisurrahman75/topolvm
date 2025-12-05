@@ -40,6 +40,79 @@ type LogicalVolumeStatus struct {
 	Code        codes.Code         `json:"code,omitempty"`
 	Message     string             `json:"message,omitempty"`
 	CurrentSize *resource.Quantity `json:"currentSize,omitempty"`
+
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// +optional
+	Snapshot *SnapshotStatus `json:"snapshot,omitempty"`
+}
+
+// SnapshotStatus defines the observed state of a backup or restore operation.
+type SnapshotStatus struct {
+	// Operation indicates whether this status is for a backup or a restore.
+	// +optional
+	Operation OperationType `json:"operation,omitempty"`
+	// Phase represents the current phase of the backup or restore operation.
+	Phase OperationPhase `json:"phase"`
+	// StartTime is the time at which the operation was started.
+	StartTime metav1.Time `json:"startTime"`
+	// CompletionTime is the time at which the operation completed (success or failure).
+	// +optional
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+	// Duration is how long operation took to complete.
+	// +optional
+	Duration string `json:"duration,omitempty"`
+	// Progress contains information about the progress of the operation.
+	// +optional
+	Progress *OperationProgress `json:"progress,omitempty"`
+	// Message provides a short description of the snapshot’s state
+	// +optional
+	Message string `json:"message,omitempty"`
+	// Error contains details if the operation encountered an error.
+	// +optional
+	Error *SnapshotError `json:"error,omitempty"`
+	// Paths are the paths that were backed up or restored
+	// +optional
+	Paths []string `json:"paths,omitempty"`
+	// Repository is the Restic repository path where the snapshot is stored
+	// +optional
+	Repository string `json:"repository,omitempty"`
+	// SnapshotID is the identifier of the Restic snapshot involved in the operation.
+	// +optional
+	SnapshotID string `json:"snapshotID,omitempty"`
+	// Version keeps track of restic binary or backup engine version used
+	// +optional
+	Version string `json:"version,omitempty"`
+}
+
+type OperationProgress struct {
+	// +optional
+	TotalBytes int64 `json:"totalBytes,omitempty"`
+
+	// +optional
+	BytesDone int64 `json:"bytesDone,omitempty"`
+
+	// Percentage can be calculated by controller or client (UploadedBytes / TotalBytes * 100)
+	// +optional
+	Percentage string `json:"percentage,omitempty"`
+}
+
+type SnapshotError struct {
+	Code    string `json:"code,omitempty"`    // e.g., "RepositoryNotReachable", "VolumeMountFailed"
+	Message string `json:"message,omitempty"` // human-readable error
+}
+
+type BackupProgress struct {
+	// +optional
+	TotalBytes int64 `json:"totalBytes,omitempty"`
+
+	// +optional
+	BytesDone int64 `json:"bytesDone,omitempty"`
+
+	// Percentage can be calculated by controller or client (UploadedBytes / TotalBytes * 100)
+	// +optional
+	Percentage string `json:"percentage,omitempty"`
 }
 
 //+kubebuilder:object:root=true

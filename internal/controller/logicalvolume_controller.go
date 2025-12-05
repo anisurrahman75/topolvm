@@ -8,11 +8,13 @@ import (
 	"github.com/topolvm/topolvm"
 	topolvmlegacyv1 "github.com/topolvm/topolvm/api/legacy/v1"
 	topolvmv1 "github.com/topolvm/topolvm/api/v1"
+	"github.com/topolvm/topolvm/internal/mounter"
 	"github.com/topolvm/topolvm/pkg/lvmd/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -23,22 +25,28 @@ import (
 
 // LogicalVolumeReconciler reconciles a LogicalVolume object
 type LogicalVolumeReconciler struct {
-	client    client.Client
+	client client.Client
+
 	nodeName  string
 	vgService proto.VGServiceClient
 	lvService proto.LVServiceClient
+	lvMount   *mounter.LVMount
+	snapshot  *snapshotHandler
 }
 
 //+kubebuilder:rbac:groups=topolvm.io,resources=logicalvolumes,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups=topolvm.io,resources=logicalvolumes/status,verbs=get;update;patch
 
 func NewLogicalVolumeReconcilerWithServices(client client.Client, nodeName string, vgService proto.VGServiceClient, lvService proto.LVServiceClient) *LogicalVolumeReconciler {
-	return &LogicalVolumeReconciler{
+	r := &LogicalVolumeReconciler{
 		client:    client,
 		nodeName:  nodeName,
 		vgService: vgService,
 		lvService: lvService,
+		lvMount:   mounter.NewLVMount(client, vgService, lvService),
 	}
+	r.snapshot = newSnapshotHandler(r)
+	return r
 }
 
 // Reconcile creates/deletes LVM logical volume for a LogicalVolume.
@@ -58,71 +66,230 @@ func (r *LogicalVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
-	if lv.Annotations != nil {
-		_, pendingDeletion := lv.Annotations[topolvm.GetLVPendingDeletionKey()]
-		if pendingDeletion {
-			if controllerutil.ContainsFinalizer(lv, topolvm.GetLogicalVolumeFinalizer()) {
-				log.Error(nil, "logical volume was pending deletion but still has finalizer", "name", lv.Name)
-			} else {
-				log.Info("skipping finalizer for logical volume due to its pending deletion", "name", lv.Name)
-			}
-			return ctrl.Result{}, nil
+	// Check for pending deletion annotation
+	if isPendingDeletion(lv) {
+		if controllerutil.ContainsFinalizer(lv, topolvm.GetLogicalVolumeFinalizer()) {
+			log.Error(nil, "logical volume was pending deletion but still has finalizer", "name", lv.Name)
+		} else {
+			log.Info("skipping finalizer for logical volume due to its pending deletion", "name", lv.Name)
 		}
-	}
-
-	if lv.DeletionTimestamp == nil {
-		if !controllerutil.ContainsFinalizer(lv, topolvm.GetLogicalVolumeFinalizer()) {
-			lv2 := lv.DeepCopy()
-			controllerutil.AddFinalizer(lv2, topolvm.GetLogicalVolumeFinalizer())
-			patch := client.MergeFrom(lv)
-			if err := r.client.Patch(ctx, lv2, patch); err != nil {
-				log.Error(err, "failed to add finalizer", "name", lv.Name)
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{RequeueAfter: requeueIntervalForSimpleUpdate}, nil
-		}
-
-		if !containsKeyAndValue(lv.Labels, topolvm.CreatedbyLabelKey, topolvm.CreatedbyLabelValue) {
-			lv2 := lv.DeepCopy()
-			if lv2.Labels == nil {
-				lv2.Labels = map[string]string{}
-			}
-			lv2.Labels[topolvm.CreatedbyLabelKey] = topolvm.CreatedbyLabelValue
-			patch := client.MergeFrom(lv)
-			if err := r.client.Patch(ctx, lv2, patch); err != nil {
-				log.Error(err, "failed to add label", "name", lv.Name)
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{RequeueAfter: requeueIntervalForSimpleUpdate}, nil
-		}
-
-		if lv.Status.VolumeID == "" {
-			err := r.createLV(ctx, log, lv)
-			if err != nil {
-				log.Error(err, "failed to create LV", "name", lv.Name)
-			}
-			return ctrl.Result{}, err
-		}
-
-		err := r.expandLV(ctx, log, lv)
-		if err != nil {
-			log.Error(err, "failed to expand LV", "name", lv.Name)
-		}
-		return ctrl.Result{}, err
-	}
-
-	// finalization
-	if !controllerutil.ContainsFinalizer(lv, topolvm.GetLogicalVolumeFinalizer()) {
-		// Our finalizer has finished, so the reconciler can do nothing.
 		return ctrl.Result{}, nil
 	}
 
-	log.Info("start finalizing LogicalVolume", "name", lv.Name)
-	err := r.removeLVIfExists(ctx, log, lv)
-	if err != nil {
+	// Handle deletion
+	if lv.DeletionTimestamp != nil {
+		return r.handleDeletion(ctx, lv, log)
+	}
+
+	// Normal reconciliation
+	return r.reconcile(ctx, lv, log)
+}
+
+func (r *LogicalVolumeReconciler) reconcile(ctx context.Context, lv *topolvmv1.LogicalVolume, log logr.Logger) (ctrl.Result, error) {
+	log.Info("reconciling LogicalVolume", "name", lv.Name)
+	if result, err := r.ensureFinalizerAndLabels(ctx, lv, log); err != nil || result.RequeueAfter > 0 {
+		return result, err
+	}
+
+	// Prepare snapshot context
+	if err := r.snapshot.buildSnapshotContext(ctx, log, lv); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to build snapshot context: %w", err)
+	}
+	if lv.Status.VolumeID == "" {
+		log.Info("LogicalVolume has no VolumeID, creating a new", "name", lv.Name)
+		return r.reconcileVolumeCreation(ctx, log, r.snapshot.shouldRestore, lv)
+	}
+
+	if err := r.reconcileVolumeExpansion(ctx, lv, log); err != nil {
 		return ctrl.Result{}, err
 	}
 
+	if r.snapshot.shouldRestore {
+		log.Info("Processing snapshot restore", "name", lv.Name, "sourceLV", r.snapshot.sourceLV.Name)
+		if result, err := r.reconcileSnapshotRestore(ctx, log, lv); err != nil || result.RequeueAfter > 0 {
+			return result, err
+		}
+	}
+
+	if err := r.snapshot.buildSnapshotContextFrBackup(ctx, log, lv); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to build snapshot context for backup: %w", err)
+	}
+	if r.snapshot.shouldBackup {
+		log.Info("Processing snapshot backup", "name", lv.Name)
+		if result, err := r.reconcileSnapshotBackup(ctx, log, lv); err != nil {
+			return result, err
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *LogicalVolumeReconciler) reconcileVolumeCreation(ctx context.Context, log logr.Logger, shouldRestore bool, lv *topolvmv1.LogicalVolume) (ctrl.Result, error) {
+	if err := r.createLV(ctx, log, lv, shouldRestore); err != nil {
+		log.Error(err, "failed to create LV", "name", lv.Name)
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *LogicalVolumeReconciler) reconcileVolumeExpansion(ctx context.Context, lv *topolvmv1.LogicalVolume, log logr.Logger) error {
+	if err := r.expandLV(ctx, log, lv); err != nil {
+		log.Error(err, "failed to expand LV", "name", lv.Name)
+		return err
+	}
+	return nil
+}
+
+func (r *LogicalVolumeReconciler) reconcileSnapshotRestore(ctx context.Context, log logr.Logger, lv *topolvmv1.LogicalVolume) (ctrl.Result, error) {
+	// Cleanup if complete
+	if isSnapshotOperationComplete(lv) {
+		log.Info("snapshot restore completed successfully", "name", lv.Name)
+		if !hasSnapshotRestoreExecutorCleanupCondition(lv) {
+			if err := r.snapshot.executeCleanerOperation(ctx, log, lv, topolvmv1.OperationRestore); err != nil {
+				log.Error(err, "failed to execute cleaner operation", "name", lv.Name)
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
+	if hasSnapshotRestoreExecutorCondition(lv) {
+		log.Info("Snapshot Restore Executor triggered previously, waiting for completion", "name", lv.Name)
+		return ctrl.Result{}, nil
+	}
+
+	// Otherwise, check if PV exists if exists, restore and return
+	pvExists, err := r.snapshot.checkPVExists(ctx, lv)
+	if err != nil {
+		log.Error(err, "Failed to check PV existence")
+		return ctrl.Result{}, err
+	}
+	if !pvExists {
+		log.Info("PV does not exist yet; waiting", "name", lv.Name)
+		return ctrl.Result{RequeueAfter: requeueIntervalForSimpleUpdate}, nil
+	}
+	if err := r.snapshot.restoreFromSnapshot(ctx, log, lv); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *LogicalVolumeReconciler) reconcileSnapshotBackup(ctx context.Context, log logr.Logger, lv *topolvmv1.LogicalVolume) (ctrl.Result, error) {
+	// Cleanup if complete
+	if isSnapshotOperationComplete(lv) {
+		log.Info("snapshot backup completed successfully", "name", lv.Name)
+		// First, cleanup the executor pod
+		if !hasSnapshotBackupExecutorCleanupCondition(lv) {
+			if err := r.snapshot.executeCleanerOperation(ctx, log, lv, topolvmv1.OperationBackup); err != nil {
+				log.Error(err, "failed to execute cleaner operation", "name", lv.Name)
+				return ctrl.Result{}, err
+			}
+		}
+
+		// Then, cleanup the LVM snapshot volume only if the snapshot operation succeeded
+		if !hasLVMSnapshotCleanupCondition(lv) &&
+			hasSnapshotBackupExecutorCleanupCondition(lv) &&
+			lv.Status.Snapshot.Phase == topolvmv1.OperationPhaseSucceeded {
+			if err := r.snapshot.cleanupLVMSnapshotAfterBackup(ctx, log, lv); err != nil {
+				log.Error(err, "failed to cleanup LVM snapshot", "name", lv.Name)
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: requeueIntervalForSimpleUpdate}, nil
+		}
+
+		msg := "LVM snapshot removed after backup completion"
+		if hasLVMSnapshotCleanupCondition(lv) && lv.Status.Message != msg {
+			if err := r.snapshot.updateStatusMessageAfterSnapshotRemoval(ctx, log, lv, msg); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to update LV status after snapshot removal: %w", err)
+			}
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	if hasSnapshotBackupExecutorCondition(lv) {
+		log.Info("Snapshot Backup Executor triggered previously, waiting for completion", "name", lv.Name)
+		return ctrl.Result{}, nil
+	}
+
+	// Otherwise, take backup of the snapshot and return
+	err := r.snapshot.backupSnapshot(ctx, log, lv)
+	return ctrl.Result{}, err
+}
+
+func (r *LogicalVolumeReconciler) ensureFinalizerAndLabels(ctx context.Context, lv *topolvmv1.LogicalVolume, log logr.Logger) (ctrl.Result, error) {
+	// Ensure finalizer
+	if !controllerutil.ContainsFinalizer(lv, topolvm.GetLogicalVolumeFinalizer()) {
+		lv2 := lv.DeepCopy()
+		controllerutil.AddFinalizer(lv2, topolvm.GetLogicalVolumeFinalizer())
+		patch := client.MergeFrom(lv)
+		if err := r.client.Patch(ctx, lv2, patch); err != nil {
+			log.Error(err, "failed to add finalizer", "name", lv.Name)
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: requeueIntervalForSimpleUpdate}, nil
+	}
+
+	// Ensure labels
+	if !containsKeyAndValue(lv.Labels, topolvm.CreatedbyLabelKey, topolvm.CreatedbyLabelValue) {
+		lv2 := lv.DeepCopy()
+		if lv2.Labels == nil {
+			lv2.Labels = map[string]string{}
+		}
+		lv2.Labels[topolvm.CreatedbyLabelKey] = topolvm.CreatedbyLabelValue
+		patch := client.MergeFrom(lv)
+		if err := r.client.Patch(ctx, lv2, patch); err != nil {
+			log.Error(err, "failed to add label", "name", lv.Name)
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: requeueIntervalForSimpleUpdate}, nil
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *LogicalVolumeReconciler) handleDeletion(ctx context.Context, lv *topolvmv1.LogicalVolume, log logr.Logger) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(lv, topolvm.GetLogicalVolumeFinalizer()) {
+		// Finalizer already removed, nothing to do
+		return ctrl.Result{}, nil
+	}
+
+	log.Info("finalizing LogicalVolume", "name", lv.Name)
+
+	if isLVHasSnapshot(lv) {
+		return r.deletionWithSnapshot(ctx, lv, log)
+	}
+
+	return r.deletionWithoutSnapshot(ctx, lv, log)
+}
+
+func (r *LogicalVolumeReconciler) deletionWithSnapshot(ctx context.Context, lv *topolvmv1.LogicalVolume, log logr.Logger) (ctrl.Result, error) {
+	if !hasSnapshotDeleteExecutorCondition(lv) {
+		if err := r.snapshot.executeSnapshotDeleteOperation(ctx, log, lv); err != nil {
+			log.Error(err, "snapshot delete operation failed", "name", lv.Name)
+			return ctrl.Result{}, err
+		}
+	}
+
+	if err := r.removeLVIfExists(ctx, log, lv); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if hasConditionSnapshotDeleteSucceeded(lv) {
+		return r.removeFinalizer(ctx, log, lv)
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *LogicalVolumeReconciler) deletionWithoutSnapshot(ctx context.Context, lv *topolvmv1.LogicalVolume, log logr.Logger) (ctrl.Result, error) {
+	if err := r.removeLVIfExists(ctx, log, lv); err != nil {
+		return ctrl.Result{}, err
+	}
+	return r.removeFinalizer(ctx, log, lv)
+}
+
+func (r *LogicalVolumeReconciler) removeFinalizer(ctx context.Context, log logr.Logger, lv *topolvmv1.LogicalVolume) (ctrl.Result, error) {
 	lv2 := lv.DeepCopy()
 	controllerutil.RemoveFinalizer(lv2, topolvm.GetLogicalVolumeFinalizer())
 	patch := client.MergeFrom(lv)
@@ -176,7 +343,7 @@ func (r *LogicalVolumeReconciler) volumeExists(ctx context.Context, log logr.Log
 	return false, nil
 }
 
-func (r *LogicalVolumeReconciler) createLV(ctx context.Context, log logr.Logger, lv *topolvmv1.LogicalVolume) error {
+func (r *LogicalVolumeReconciler) createLV(ctx context.Context, log logr.Logger, lv *topolvmv1.LogicalVolume, restoreFrSnapshot bool) error {
 	// When lv.Status.Code is not codes.OK (== 0), CreateLV has already failed.
 	// LogicalVolume CRD will be deleted soon by the controller.
 	if lv.Status.Code != codes.OK {
@@ -205,7 +372,7 @@ func (r *LogicalVolumeReconciler) createLV(ctx context.Context, log logr.Logger,
 		var volume *proto.LogicalVolume
 
 		// Create a snapshot LV
-		if lv.Spec.Source != "" {
+		if lv.Spec.Source != "" && !restoreFrSnapshot {
 			// accessType should be either "readonly" or "readwrite".
 			if lv.Spec.AccessType != "ro" && lv.Spec.AccessType != "rw" {
 				return fmt.Errorf("invalid access type for source volume: %s", lv.Spec.AccessType)
@@ -255,6 +422,10 @@ func (r *LogicalVolumeReconciler) createLV(ctx context.Context, log logr.Logger,
 			volume = resp.Volume
 		}
 
+		if restoreFrSnapshot {
+			metav1.SetMetaDataAnnotation(&lv.ObjectMeta, topolvm.GetResticRestoreRequiredKey(), "true")
+		}
+
 		lv.Status.VolumeID = volume.Name
 		lv.Status.CurrentSize = resource.NewQuantity(volume.SizeBytes, resource.BinarySI)
 		lv.Status.Code = codes.OK
@@ -270,11 +441,10 @@ func (r *LogicalVolumeReconciler) createLV(ctx context.Context, log logr.Logger,
 		return err
 	}
 
-	if err := r.client.Status().Update(ctx, lv); err != nil {
+	if err := updateLVStatus(ctx, r.client, lv); err != nil {
 		log.Error(err, "failed to update status", "name", lv.Name, "uid", lv.UID)
 		return err
 	}
-
 	log.Info("created new LV", "name", lv.Name, "uid", lv.UID, "status.volumeID", lv.Status.VolumeID)
 	return nil
 }
@@ -333,6 +503,7 @@ func (r *LogicalVolumeReconciler) expandLV(ctx context.Context, log logr.Logger,
 	return nil
 }
 
+// logicalVolumeFilter filters LogicalVolume by nodeName.
 type logicalVolumeFilter struct {
 	nodeName string
 }
