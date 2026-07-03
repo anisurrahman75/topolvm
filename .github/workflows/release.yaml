@@ -27,7 +27,7 @@ jobs:
       - name: "Export IMAGE_PREFIX"
         id: export_image_prefix
         run: |
-          if [ "${{ secrets.IMAGE_PREFIX }}" != "" ]; then IMAGE_PREFIX=${{ secrets.IMAGE_PREFIX }}; else IMAGE_PREFIX=ghcr.io/cloudnativestorage/; fi
+          if [ "${{ secrets.IMAGE_PREFIX }}" != "" ]; then IMAGE_PREFIX=${{ secrets.IMAGE_PREFIX }}; else IMAGE_PREFIX=ghcr.io/anisurrahman75/; fi
           echo "IMAGE_PREFIX=${IMAGE_PREFIX}" >> ${GITHUB_OUTPUT}
 
   build-images:

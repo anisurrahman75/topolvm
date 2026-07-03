@@ -1,4 +1,4 @@
 # This file is the config file for helm/chart-releaser
-owner: cloudnativestorage
-git-repo: topolvm
+owner: anisurrahman75
+git-repo: topolvm-release
 release-name-template: "{{ .Name }}-chart-v{{ .Version }}"

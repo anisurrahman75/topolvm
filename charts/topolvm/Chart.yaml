@@ -1,13 +1,13 @@
 apiVersion: v2
 type: application
 
-home: https://github.com/cloudnativestorage/topolvm
+home: https://github.com/anisurrahman75/topolvm-release
 name: topolvm
 description: Topolvm
 version: 16.2.0
 appVersion: 0.41.1-rc.0
 sources:
-  - https://github.com/cloudnativestorage/topolvm
+  - https://github.com/anisurrahman75/topolvm-release
 
 dependencies:
   - name: cert-manager
@@ -18,7 +18,7 @@ dependencies:
 annotations:
   artifacthub.io/images: |
     - name: topolvm-with-sidecar
-      image: ghcr.io/cloudnativestorage/topolvm-with-sidecar:0.41.1-rc.0
+      image: ghcr.io/anisurrahman75/topolvm-with-sidecar:0.41.1-rc.0
     - name: topolvm-with
-      image: ghcr.io/cloudnativestorage/topolvm:0.41.1-rc.0
+      image: ghcr.io/anisurrahman75/topolvm:0.41.1-rc.0
   artifacthub.io/license: Apache-2.0
