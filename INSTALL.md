@@ -109,6 +109,19 @@ EOF
 kubectl get pvc topolvm-test -w   # should reach Bound
 ```
 
+## Verified
+
+This release was verified end-to-end on a single-node kind cluster (k8s v1.34):
+cert-manager + chart install succeeded, both `ghcr.io/anisurrahman75` images
+pulled, controller/node/lvmd pods ran, and a 1Gi PVC bound and mounted (xfs) with
+a logical volume carved from the `myvg1` volume group.
+
+> **Testing on kind/containers:** LVM inside a container has no udev, so volume
+> creation fails with `device not cleared`. Disable udev in the node's
+> `/etc/lvm/lvm.conf` (`activation { udev_sync = 0  udev_rules = 0 }` and
+> `devices { obtain_device_list_from_udev = 0 }`). This is not needed on real
+> hosts running a normal udev.
+
 ## Uninstall
 
 ```bash
