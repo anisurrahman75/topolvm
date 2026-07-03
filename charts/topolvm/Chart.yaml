@@ -1,13 +1,13 @@
 apiVersion: v2
 type: application
 
-home: https://github.com/anisurrahman75/topolvm-release
+home: https://github.com/anisurrahman75/topolvm
 name: topolvm
 description: Topolvm
 version: 16.2.0
 appVersion: 0.41.1-rc.0
 sources:
-  - https://github.com/anisurrahman75/topolvm-release
+  - https://github.com/anisurrahman75/topolvm
 
 dependencies:
   - name: cert-manager
