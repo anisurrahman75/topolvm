@@ -49,16 +49,16 @@ helm install topolvm oci://ghcr.io/anisurrahman75/charts/topolvm --version 16.2.
 **Option B — classic Helm repo:**
 
 ```bash
-helm repo add topolvm-fork https://anisurrahman75.github.io/topolvm
+helm repo add topolvm https://anisurrahman75.github.io/topolvm
 helm repo update
-helm install topolvm topolvm-fork/topolvm --version 16.2.0 \
+helm install topolvm topolvm/topolvm --version 16.2.0 \
   -n topolvm-system --create-namespace
 ```
 
-> **Note:** if you already have the official repo added as `topolvm`
-> (`https://topolvm.github.io/topolvm`), keep this fork under a different alias
-> (e.g. `topolvm-fork` as above) — the official index tops out at chart 16.1.1
-> and does not contain 16.2.0.
+> **Note:** if the `topolvm` alias on your machine already points at the official
+> repo (`https://topolvm.github.io/topolvm`), add this fork under another alias
+> (e.g. `helm repo add topolvm-fork https://anisurrahman75.github.io/topolvm`) —
+> the official index tops out at chart 16.1.1 and does not contain 16.2.0.
 
 To point lvmd at a different volume group:
 

@@ -28,9 +28,9 @@ helm install cert-manager jetstack/cert-manager \
   -n cert-manager --create-namespace --set crds.enabled=true
 
 # 2. TopoLVM (public Helm repo — no auth)
-helm repo add topolvm-fork https://anisurrahman75.github.io/topolvm
+helm repo add topolvm https://anisurrahman75.github.io/topolvm
 helm repo update
-helm install topolvm topolvm-fork/topolvm --version 16.2.0 \
+helm install topolvm topolvm/topolvm --version 16.2.0 \
   -n topolvm-system --create-namespace
 ```
 
