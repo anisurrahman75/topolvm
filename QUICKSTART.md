@@ -63,8 +63,9 @@ helm install topolvm oci://ghcr.io/anisurrahman75/charts/topolvm --version 16.2.
   -n topolvm-system --create-namespace
 ```
 
-> If the `topolvm` alias on your machine already points at the official repo,
-> add this one under a different alias — the official index has no 16.2.0.
+> If the `topolvm` alias already exists on your machine (e.g. pointing at the
+> official repo, whose index has no 16.2.0), repoint it:
+> `helm repo add topolvm https://anisurrahman75.github.io/topolvm --force-update`
 
 Custom volume group:
 
