@@ -1,46 +1,32 @@
 # Installing TopoLVM (`ac-v0.41.1-rc.0` / chart `16.2.0`)
 
 This guide installs the fork build of TopoLVM published from
-[`anisurrahman75/topolvm`](https://github.com/anisurrahman75/topolvm).
+[`anisurrahman75/topolvm`](https://github.com/anisurrahman75/topolvm), which adds
+Restic/Kopia-based online snapshot backup & restore.
 
-## Published artifacts
+## Published artifacts — all public, no login or pull secret required
 
 | Artifact | Reference |
 | --- | --- |
 | Controller/node image | `ghcr.io/anisurrahman75/topolvm:0.41.1-rc.0` |
 | Image with CSI sidecars | `ghcr.io/anisurrahman75/topolvm-with-sidecar:0.41.1-rc.0` |
-| Helm chart (OCI) | `oci://ghcr.io/anisurrahman75/charts/topolvm` (version `16.2.0`, appVersion `0.41.1-rc.0`) |
+| Helm chart (classic repo) | `https://anisurrahman75.github.io/topolvm` (version `16.2.0`) |
+| Helm chart (OCI) | `oci://ghcr.io/anisurrahman75/charts/topolvm` (version `16.2.0`) |
+| GitHub releases | app `ac-v0.41.1-rc.0` (lvmd tarball) · chart `topolvm-chart-v16.2.0` |
 
 The chart's default `image.repository` is `ghcr.io/anisurrahman75/topolvm-with-sidecar`
-and the image tag defaults to the chart's `appVersion`.
+and the image tag defaults to the chart's `appVersion` (`0.41.1-rc.0`).
 
 ## Prerequisites
 
 - A Kubernetes cluster, v1.33–1.35.
-- `kubectl` and `helm` (v3.8+, for OCI support).
+- `kubectl` and `helm` (v3.8+ for OCI support).
 - **cert-manager** in the cluster — TopoLVM's mutating webhook uses it for TLS
   (chart default `webhook.certManager: true`).
 - **An LVM volume group on every storage node.** The chart's default device-class
   is `ssd` backed by volume group **`myvg1`** (`lvmd.deviceClasses`). The node
   plugin (`lvmd`) will not become Ready until that volume group exists on the node.
   Adjust `lvmd.deviceClasses[].volume-group` to match your environment.
-
-### If the GHCR packages are private
-
-Fresh GHCR packages default to **private**. Either make them Public in the GitHub
-package settings (Package → Package settings → Danger Zone → Change visibility), or
-authenticate:
-
-```bash
-# a GitHub token with read:packages
-echo "$GHCR_TOKEN" | helm registry login ghcr.io -u anisurrahman75 --password-stdin
-
-# and a pull secret so the cluster can pull the private image
-kubectl create namespace topolvm-system
-kubectl -n topolvm-system create secret docker-registry ghcr-cred \
-  --docker-server=ghcr.io --docker-username=anisurrahman75 --docker-password="$GHCR_TOKEN"
-# then add:  --set image.pullSecrets[0].name=ghcr-cred   to the helm install below
-```
 
 ## 1. Install cert-manager
 
@@ -53,23 +39,30 @@ kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout=180
 
 ## 2. Install TopoLVM
 
+**Option A — OCI (simplest, no repo alias needed):**
+
 ```bash
 helm install topolvm oci://ghcr.io/anisurrahman75/charts/topolvm --version 16.2.0 \
   -n topolvm-system --create-namespace
 ```
 
-Label application namespaces so the webhook mutates their pods (skip
-`topolvm-system` and `kube-system`):
+**Option B — classic Helm repo:**
 
 ```bash
-kubectl label namespace default topolvm.io/webhook=ignore-  # example; see docs/
+helm repo add topolvm-fork https://anisurrahman75.github.io/topolvm
+helm repo update
+helm install topolvm topolvm-fork/topolvm --version 16.2.0 \
+  -n topolvm-system --create-namespace
 ```
+
+> **Note:** if you already have the official repo added as `topolvm`
+> (`https://topolvm.github.io/topolvm`), keep this fork under a different alias
+> (e.g. `topolvm-fork` as above) — the official index tops out at chart 16.1.1
+> and does not contain 16.2.0.
 
 To point lvmd at a different volume group:
 
 ```bash
-helm install topolvm oci://ghcr.io/anisurrahman75/charts/topolvm --version 16.2.0 \
-  -n topolvm-system --create-namespace \
   --set lvmd.deviceClasses[0].name=ssd \
   --set lvmd.deviceClasses[0].volume-group=YOUR_VG \
   --set lvmd.deviceClasses[0].default=true \
@@ -87,10 +80,11 @@ kubectl -n topolvm-system get pods -o wide
 
 # CRDs and storage class
 kubectl get crd | grep topolvm
-kubectl get storageclass
+kubectl get storageclass topolvm-provisioner
 ```
 
-A quick provisioning smoke test (requires a working volume group on a node):
+A quick provisioning smoke test (the StorageClass uses `WaitForFirstConsumer`,
+so a consuming pod is required for the PVC to bind):
 
 ```bash
 kubectl apply -f - <<'EOF'
@@ -104,6 +98,21 @@ spec:
     requests:
       storage: 1Gi
   storageClassName: topolvm-provisioner
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: topolvm-test-pod
+spec:
+  containers:
+  - name: app
+    image: busybox:1.36
+    command: ["sh","-c","sleep 3600"]
+    volumeMounts:
+    - { name: vol, mountPath: /data }
+  volumes:
+  - name: vol
+    persistentVolumeClaim: { claimName: topolvm-test }
 EOF
 
 kubectl get pvc topolvm-test -w   # should reach Bound
@@ -112,7 +121,8 @@ kubectl get pvc topolvm-test -w   # should reach Bound
 ## Verified
 
 This release was verified end-to-end on a single-node kind cluster (k8s v1.34):
-cert-manager + chart install succeeded, both `ghcr.io/anisurrahman75` images
+cert-manager + chart install succeeded (both via OCI and the classic Helm repo,
+with **no registry authentication**), the public `ghcr.io/anisurrahman75` images
 pulled, controller/node/lvmd pods ran, and a 1Gi PVC bound and mounted (xfs) with
 a logical volume carved from the `myvg1` volume group.
 
