@@ -1,23 +1,45 @@
-# TopoLVM (fork) — Quick Start
+# TopoLVM with Off-Cluster Snapshot Backup & Restore — Quick Start
 
-A fork build of [TopoLVM](https://github.com/topolvm/topolvm) published from
-[`anisurrahman75/topolvm`](https://github.com/anisurrahman75/topolvm), with the
-Restic/Kopia online-snapshot work. **App `0.41.1-rc.0`, chart `16.2.0`.**
+**Native Linux LVM performance for Kubernetes databases, now with S3/GCS/Azure
+snapshot backups.**
 
-All artifacts below are **public** — no login or pull secret required.
+This is a fork build of [TopoLVM](https://github.com/topolvm/topolvm) that adds
+**online VolumeSnapshot backup & restore**: LVM thin COW snapshots are shipped to
+remote object storage with **encryption, deduplication, and compression**
+(Restic-based engine), and restored through the standard CSI flow — data streams
+back from remote storage at first mount, onto **any healthy node**.
 
-| Artifact | Reference | Public |
-| --- | --- | --- |
-| Image | `ghcr.io/anisurrahman75/topolvm:0.41.1-rc.0` | ✅ |
-| Image (with CSI sidecars) | `ghcr.io/anisurrahman75/topolvm-with-sidecar:0.41.1-rc.0` | ✅ |
-| Helm chart | `https://anisurrahman75.github.io/topolvm` (version `16.2.0`) | ✅ |
+![TopoLVM snapshot backup & restore flow](./topolvm-snapshot-flow.svg)
+
+## Why this matters
+
+TopoLVM carves volumes straight from node-local disks — near bare-metal I/O
+latency, which is why it's a favorite for PostgreSQL, MySQL, Kafka, ClickHouse,
+and Elasticsearch. But node-local also meant: **if the node dies, the volume and
+all its snapshots die with it.** This build closes that gap:
+
+- 📸 `VolumeSnapshot` → instant LVM thin COW snapshot (workload keeps running)
+- 🚚 A snapshotter pod on the LV's node ships the data to **S3 / GCS / Azure**
+- 🔒 Encrypted, deduplicated, compressed at rest
+- ♻️ Restore = create a PVC from the snapshot; data streams back at first mount
+- ⚙️ Backend configured with a Kubernetes-native `SnapshotBackupStorage` CRD
+
+## Published artifacts — all public, no login required
+
+| Artifact | Reference |
+| --- | --- |
+| Image | `ghcr.io/anisurrahman75/topolvm:0.41.1-rc.0` |
+| Image (with CSI sidecars) | `ghcr.io/anisurrahman75/topolvm-with-sidecar:0.41.1-rc.0` |
+| Helm chart | `https://anisurrahman75.github.io/topolvm` — version `16.2.0` |
+| Helm chart (OCI) | `oci://ghcr.io/anisurrahman75/charts/topolvm` — version `16.2.0` |
 
 ## Prerequisites
 
-- Kubernetes v1.33–1.35, plus `kubectl` and `helm` (v3.8+).
-- **cert-manager** (the webhook needs it).
-- **An LVM volume group on each storage node** — the default device-class `ssd`
-  uses volume group **`myvg1`**. Change `lvmd.deviceClasses[].volume-group` to match.
+- Kubernetes v1.33–1.35, `kubectl`, `helm` (v3.8+).
+- **cert-manager** (the admission webhook needs TLS).
+- **An LVM volume group on each storage node.** The default device-class `ssd`
+  expects volume group **`myvg1`** — change
+  `lvmd.deviceClasses[].volume-group` to match your nodes.
 
 ## Install
 
@@ -27,21 +49,24 @@ helm repo add jetstack https://charts.jetstack.io && helm repo update
 helm install cert-manager jetstack/cert-manager \
   -n cert-manager --create-namespace --set crds.enabled=true
 
-# 2. TopoLVM (public Helm repo — no auth)
+# 2. TopoLVM
 helm repo add topolvm https://anisurrahman75.github.io/topolvm
 helm repo update
 helm install topolvm topolvm/topolvm --version 16.2.0 \
   -n topolvm-system --create-namespace
 ```
 
-Or via OCI, with no repo alias at all:
+Or install the chart via OCI, no repo alias needed:
 
 ```bash
 helm install topolvm oci://ghcr.io/anisurrahman75/charts/topolvm --version 16.2.0 \
   -n topolvm-system --create-namespace
 ```
 
-Point lvmd at your volume group if it isn't `myvg1`:
+> If the `topolvm` alias on your machine already points at the official repo,
+> add this one under a different alias — the official index has no 16.2.0.
+
+Custom volume group:
 
 ```bash
   --set lvmd.deviceClasses[0].name=ssd \
@@ -53,13 +78,12 @@ Point lvmd at your volume group if it isn't `myvg1`:
 ## Verify
 
 ```bash
-kubectl -n topolvm-system rollout status deploy/topolvm-controller
-kubectl -n topolvm-system get pods
-kubectl get storageclass topolvm-provisioner
+kubectl -n topolvm-system get pods            # controller / node / lvmd Running
+kubectl get storageclass topolvm-provisioner  # provisioner: topolvm.io
 ```
 
-Provision a volume (needs a working volume group and a consuming pod, because the
-StorageClass uses `WaitForFirstConsumer`):
+Provision a volume (the StorageClass uses `WaitForFirstConsumer`, so the PVC
+binds once a pod mounts it):
 
 ```bash
 kubectl apply -f - <<'EOF'
@@ -88,6 +112,15 @@ EOF
 kubectl get pvc topolvm-test -w   # -> Bound
 ```
 
+Every step above was verified end-to-end on a kind cluster (k8s v1.34) with a
+clean helm configuration and **zero registry authentication**.
+
+> **Testing on kind?** LVM in a container has no udev — set
+> `activation { udev_sync = 0  udev_rules = 0 }` and
+> `devices { obtain_device_list_from_udev = 0 }` in the node's
+> `/etc/lvm/lvm.conf`, or volume creation fails with `device not cleared`.
+> Real hosts don't need this.
+
 ## Uninstall
 
 ```bash
@@ -95,10 +128,13 @@ helm uninstall topolvm -n topolvm-system
 kubectl delete namespace topolvm-system
 ```
 
----
+> The chart templates its CRDs, so `helm uninstall` deletes them too. If you
+> reinstall immediately, wait for the `logicalvolumes.topolvm.io` CRD to finish
+> terminating first (`kubectl get crd | grep topolvm`), or the fresh install can
+> race with the deletion.
 
-### Alternative: OCI chart
+## Learn more
 
-An OCI copy exists at `oci://ghcr.io/anisurrahman75/charts/topolvm` (version `16.2.0`).
-It is currently **private**; use the public Helm repo above, or `helm registry login
-ghcr.io` first if you prefer OCI.
+- Design doc: [`design/restic-snapshot/DESIGN.md`](./design/restic-snapshot/DESIGN.md)
+- Full install guide: [`INSTALL.md`](./INSTALL.md)
+- Upstream project: [topolvm/topolvm](https://github.com/topolvm/topolvm)
